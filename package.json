@@ -1,0 +1,37 @@
+{
+  "name": "pollinate",
+  "version": "1.0.0",
+  "description": "Standalone trigger substrate for schedules, polls, webhooks, and fired actions.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "pollinate": "dist/cli.js",
+    "pol": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "PRD.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "check": "pnpm build && pnpm test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.28.0",
+  "dependencies": {
+    "jsonpath-plus": "^10.4.0",
+    "smol-toml": "^1.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.2",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  }
+}
