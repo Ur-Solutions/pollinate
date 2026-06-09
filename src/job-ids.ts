@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readdir, readFile, stat, unlink } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { atomicWriteFile, jobsDir, readJsonOr, stateDir } from "./fsx.js";
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { atomicWriteFile, jobsDir, readJsonOr, stateDir, withFileLock } from "./fsx.js";
 import type { Job, Trigger } from "./types.js";
 
 export type JobIdentity = {
@@ -21,8 +21,6 @@ export type AllocateJobIdentityOptions = {
 };
 
 export const MIN_JOB_ID_CHARS = 3;
-
-const LOCK_STALE_MS = 30_000;
 
 export async function allocateJobIdentity(options: AllocateJobIdentityOptions): Promise<JobIdentity> {
   return withFileLock(jobIdIndexLockPath(options.root), async () => {
@@ -176,34 +174,4 @@ function commonPrefixLength(a: string, b: string): number {
   let length = 0;
   while (length < max && a[length] === b[length]) length += 1;
   return length;
-}
-
-async function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  for (;;) {
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
-    try {
-      handle = await open(path, "wx", 0o600);
-      await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`, "utf8");
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      await removeStaleLock(path);
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    } finally {
-      await handle?.close();
-    }
-  }
-
-  try {
-    return await fn();
-  } finally {
-    await unlink(path).catch(() => undefined);
-  }
-}
-
-async function removeStaleLock(path: string): Promise<void> {
-  const info = await stat(path).catch(() => undefined);
-  if (!info) return;
-  if (Date.now() - info.mtimeMs > LOCK_STALE_MS) await unlink(path).catch(() => undefined);
 }

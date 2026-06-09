@@ -1,4 +1,4 @@
-import { chmod, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -88,4 +88,36 @@ export async function removePath(path: string): Promise<void> {
 
 export function isEnoent(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: string }).code === "ENOENT";
+}
+
+const LOCK_STALE_MS = 30_000;
+
+export async function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  for (;;) {
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      handle = await open(path, "wx", 0o600);
+      await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`, "utf8");
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      await removeStaleLock(path);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    } finally {
+      await handle?.close();
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    await unlink(path).catch(() => undefined);
+  }
+}
+
+async function removeStaleLock(path: string): Promise<void> {
+  const info = await stat(path).catch(() => undefined);
+  if (!info) return;
+  if (Date.now() - info.mtimeMs > LOCK_STALE_MS) await unlink(path).catch(() => undefined);
 }
