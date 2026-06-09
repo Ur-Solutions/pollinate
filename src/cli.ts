@@ -7,6 +7,8 @@ import { parseDuration, sleep, nowIso } from "./time.js";
 import { slugify } from "./config.js";
 import { applyWebhookTransform } from "./webhook.js";
 import { runForeground } from "./daemon.js";
+import { SatelliteServer } from "./satellite.js";
+import { createWebhookHook, gcTemporaryHooks, randomHookToken, type HookCreateResult } from "./hooks.js";
 import {
   daemonLogs,
   daemonStatus,
@@ -48,56 +50,64 @@ const TERMINAL = new Set<JobStatus>(["completed", "errored", "timed-out", "cance
 
 async function main(argv = process.argv.slice(2)): Promise<void> {
   const args = parseArgs(argv);
-  const store = new PollinateStore();
-  await store.ensure();
+  let store: PollinateStore | undefined;
+  const getStore = async () => {
+    store ??= new PollinateStore();
+    await store.ensure();
+    return store;
+  };
   switch (args.command) {
     case "add":
-      await cmdAdd(store, args);
+      await cmdAdd(await getStore(), args);
       return;
     case "create":
-      await cmdCreate(store, args);
+      await cmdCreate(await getStore(), args);
       return;
     case "list":
-      await cmdList(store, args);
+    case "ls":
+      await cmdList(await getStore(), args);
       return;
     case "get":
-      await cmdGet(store, args);
+      await cmdGet(await getStore(), args);
       return;
     case "enable":
-      await cmdEnable(store, args, true);
+      await cmdEnable(await getStore(), args, true);
       return;
     case "disable":
-      await cmdEnable(store, args, false);
+      await cmdEnable(await getStore(), args, false);
       return;
     case "remove":
-      await cmdRemove(store, args);
+      await cmdRemove(await getStore(), args);
       return;
     case "edit":
-      await cmdEdit(store, args);
+      await cmdEdit(await getStore(), args);
       return;
     case "trigger":
-      await cmdTrigger(store, args);
+      await cmdTrigger(await getStore(), args);
       return;
     case "jobs":
-      await cmdJobs(store, args);
+      await cmdJobs(await getStore(), args);
       return;
     case "job":
-      await cmdJob(store, args);
+      await cmdJob(await getStore(), args);
       return;
     case "hooks":
-      await cmdHooks(store, args);
+      await cmdHooks(await getStore(), args);
       return;
     case "hook":
-      await cmdHook(store, args);
+      await cmdHook(await getStore(), args);
       return;
     case "daemon":
       await cmdDaemon(args);
       return;
+    case "satellite":
+      await cmdSatellite(args);
+      return;
     case "status":
-      await cmdStatus(store, args);
+      await cmdStatus(await getStore(), args);
       return;
     case "ledger":
-      await cmdLedger(store, args);
+      await cmdLedger(await getStore(), args);
       return;
     case "help":
     case undefined:
@@ -347,7 +357,27 @@ function renderHookList(hooks: HookRow[]): string {
 }
 
 async function cmdHook(store: PollinateStore, args: ParsedArgs): Promise<void> {
-  if (args.rest[0] !== "test") throw new Error("Usage: pollinate hook test <id> --payload '{...}'");
+  const sub = requiredArg(args.rest[0], "Usage: pollinate hook <create|inbox|wait|gc|test> ...");
+  if (sub === "create") {
+    const created = await createHookFromArgs(store, args, {});
+    print(args, hookCreateJson(created), renderHookCreated(created));
+    return;
+  }
+  if (sub === "inbox") {
+    const created = await createHookFromArgs(store, args, { defaultTtl: "1h", subjectPrefix: "pollinate.inbox" });
+    print(args, hookCreateJson(created), renderHookCreated(created));
+    return;
+  }
+  if (sub === "wait") {
+    await cmdHookWait(store, args);
+    return;
+  }
+  if (sub === "gc") {
+    const removed = await gcTemporaryHooks(store);
+    print(args, { removed }, removed.length ? say.ok(`removed ${removed.length} expired temporary ${plural(removed.length, "hook")}`) : c.dim("No expired temporary hooks."));
+    return;
+  }
+  if (sub !== "test") throw new Error("Usage: pollinate hook <create|inbox|wait|gc|test> ...");
   const trigger = await store.requireTrigger(requiredArg(args.rest[1], "Usage: pollinate hook test <id> --payload '{...}'"));
   if (trigger.source.kind !== "webhook") throw new Error(`Trigger ${trigger.id} is not a webhook trigger`);
   const payload = parsePayload(stringFlag(args, "payload") ?? "{}");
@@ -362,6 +392,94 @@ async function cmdHook(store: PollinateStore, args: ParsedArgs): Promise<void> {
     executor.executeJob(job, trigger, activation, [transformed]),
   );
   print(args, completed, renderJobOutcome(completed));
+}
+
+async function cmdHookWait(store: PollinateStore, args: ParsedArgs): Promise<void> {
+  const ttl = stringFlag(args, "ttl") ?? "10m";
+  const created = await createHookFromArgs(store, args, { defaultTtl: ttl, defaultMaxDeliveries: 1, subjectPrefix: "pollinate.wait" });
+  if (!args.json) console.log(renderHookCreated(created));
+  const timeoutMs = parseDuration(ttl);
+  const deadline = Date.now() + timeoutMs;
+  try {
+    for (;;) {
+      const jobs = await store.listJobs({ triggerId: created.trigger.id, last: 20 });
+      const completed = jobs.find((job) => TERMINAL.has(job.status));
+      if (completed) {
+        await store.removeTrigger(created.trigger.id).catch(() => undefined);
+        print(args, { ...hookCreateJson(created), payload: completed.batch?.[0], job: completed }, `${jobBadge(completed.status)} ${c.bold(created.trigger.id)}`);
+        return;
+      }
+      if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${created.url ?? `/hook/${created.path}`}`);
+      await sleep(100);
+    }
+  } catch (error) {
+    await store.removeTrigger(created.trigger.id).catch(() => undefined);
+    throw error;
+  }
+}
+
+type HookCreateDefaults = {
+  defaultTtl?: string;
+  defaultMaxDeliveries?: number;
+  subjectPrefix?: string;
+};
+
+async function createHookFromArgs(store: PollinateStore, args: ParsedArgs, defaults: HookCreateDefaults): Promise<HookCreateResult> {
+  const id = slugify(args.rest[1] ?? `hook-${randomHookToken().slice(0, 8)}`);
+  const ttl = stringFlag(args, "ttl") ?? defaults.defaultTtl;
+  const maxDeliveries = args.flags.once ? 1 : (numberFlag(args, "max-deliveries") ?? defaults.defaultMaxDeliveries);
+  const config = await store.daemonConfig();
+  const baseUrl = stringFlag(args, "base-url") ?? config.webhook.publicUrl;
+  const created = createWebhookHook({
+    id,
+    path: stringFlag(args, "path"),
+    ttl,
+    baseUrl,
+    secret: stringFlag(args, "secret"),
+    transform: keyValueRecord(flagValues(args, "transform")),
+    maxDeliveries,
+    action: actionFromFlagsOrDefault(args, {
+      kind: "emit",
+      subject: `${defaults.subjectPrefix ?? "pollinate.hook"}.${id}`,
+      payload: "{{event}}",
+    }),
+    delivery: deliveryFromFlags(args),
+    tags: ["temporary", ...flagValues(args, "tag")],
+  });
+  await store.saveTrigger(created.trigger);
+  await store.appendLedger({
+    event: "pollinate.hook.created",
+    trigger_id: created.id,
+    path: created.path,
+    url: created.url,
+    expires_at: created.expiresAt,
+    max_deliveries: created.maxDeliveries,
+  });
+  return created;
+}
+
+function actionFromFlagsOrDefault(args: ParsedArgs, fallback: Action): Action {
+  if (stringFlag(args, "action") || stringFlag(args, "action-json") || stringFlag(args, "command")) return actionFromFlags(args);
+  return fallback;
+}
+
+function hookCreateJson(created: HookCreateResult): Record<string, unknown> {
+  return {
+    id: created.id,
+    path: created.path,
+    url: created.url,
+    expiresAt: created.expiresAt,
+    maxDeliveries: created.maxDeliveries,
+    trigger: created.trigger,
+  };
+}
+
+function renderHookCreated(created: HookCreateResult): string {
+  const target = created.url ?? `/hook/${created.path}`;
+  const lines = [`${say.ok(`created ${c.bold(created.id)}`)}  ${c.cyan(target)}`];
+  if (created.expiresAt) lines.push(`  ${field("expires", timestampField(created.expiresAt))}`);
+  if (created.maxDeliveries) lines.push(`  ${field("deliveries", String(created.maxDeliveries))}`);
+  return lines.join("\n");
 }
 
 async function cmdDaemon(args: ParsedArgs): Promise<void> {
@@ -407,6 +525,32 @@ async function cmdDaemon(args: ParsedArgs): Promise<void> {
     return;
   }
   throw new Error(`Unknown daemon command: ${sub}`);
+}
+
+async function cmdSatellite(args: ParsedArgs): Promise<void> {
+  const sub = requiredArg(args.rest[0], "Usage: pollinate satellite run --target <url> --secret <secret> [--bind 0.0.0.0] [--port 3979]");
+  if (sub !== "run") throw new Error(`Unknown satellite command: ${sub}`);
+  const server = new SatelliteServer({
+    bind: stringFlag(args, "bind") ?? "0.0.0.0",
+    port: numberFlag(args, "port") ?? 3979,
+    target: requiredFlag(args, "target", "Satellite mode requires --target <local-daemon-base-url>"),
+    relaySecret: requiredFlag(args, "secret", "Satellite mode requires --secret <secret-or-env:NAME>"),
+    forwardTimeoutMs: parseDuration(stringFlag(args, "timeout"), 10_000),
+  });
+  await server.start();
+  const address = server.address();
+  print(
+    args,
+    { listening: address, target: stringFlag(args, "target") },
+    `${say.ok("satellite listening")}  ${c.dim(`${address?.address ?? "0.0.0.0"}:${address?.port ?? numberFlag(args, "port") ?? 3979} -> ${stringFlag(args, "target")}`)}`,
+  );
+  const stop = async () => {
+    await server.stop();
+    process.exit(0);
+  };
+  process.once("SIGINT", () => void stop());
+  process.once("SIGTERM", () => void stop());
+  await new Promise<void>(() => undefined);
 }
 
 async function cmdStatus(store: PollinateStore, args: ParsedArgs): Promise<void> {
@@ -940,19 +1084,30 @@ function parseArgs(argv: string[]): ParsedArgs {
     if (token.startsWith("--")) {
       const raw = token.slice(2);
       const [key, inline] = raw.split("=", 2);
-      const value = inline ?? flagValue(key, argv, () => {
-        index += 1;
-        return argv[index];
-      });
+      const value =
+        inline ??
+        optionalFlagValue(key, argv[index + 1], (value) => {
+          index += 1;
+          return value;
+        }) ??
+        flagValue(key, argv, () => {
+          index += 1;
+          return argv[index];
+        });
       addFlag(flags, key, value);
       continue;
     }
     if (token.startsWith("-") && token.length > 1) {
       const key = token.slice(1);
-      const value = flagValue(key, argv, () => {
-        index += 1;
-        return argv[index];
-      });
+      const value =
+        optionalFlagValue(key, argv[index + 1], (value) => {
+          index += 1;
+          return value;
+        }) ??
+        flagValue(key, argv, () => {
+          index += 1;
+          return argv[index];
+        });
       addFlag(flags, key, value);
       continue;
     }
@@ -960,6 +1115,12 @@ function parseArgs(argv: string[]): ParsedArgs {
     else rest.push(token);
   }
   return { command, rest, flags, json: Boolean(flags.json) };
+}
+
+function optionalFlagValue(key: string, next: string | undefined, consume: (value: string) => string): string | boolean | undefined {
+  if (key !== "once") return undefined;
+  if (next === undefined || next.startsWith("-")) return true;
+  return consume(next);
 }
 
 function flagValue(key: string, argv: string[], consume: () => string): string | boolean {
@@ -1043,7 +1204,7 @@ async function printHelp(): Promise<void> {
     helpSection("Triggers", [
       ["add <file.toml>", "register a trigger from a TOML file"],
       ["create <id> …", "build a trigger from flags (see shortcuts)"],
-      ["list [--enabled|--disabled]", "list triggers, filter by --tag / --source"],
+      ["list, ls [--enabled|--disabled]", "list triggers, filter by --tag / --source"],
       ["get <id>", "show a trigger in detail"],
       ["enable / disable <id>", "toggle a trigger"],
       ["edit <id>", "open the trigger TOML in $EDITOR"],
@@ -1057,7 +1218,12 @@ async function printHelp(): Promise<void> {
       ["jobs [--status <s>] [--last n]", "list recent jobs"],
       ["job <jobId> | job cancel <id>", "inspect or cancel a job"],
       ["hooks", "list webhook endpoints"],
+      ["hook create <id> [--ttl 10m]", "create a temporary webhook URL"],
+      ["hook inbox [id]", "create a temporary emit-only webhook"],
+      ["hook wait [id]", "wait for one one-shot webhook delivery"],
+      ["hook gc", "remove expired or spent temporary hooks"],
       ["hook test <id> --payload …", "simulate a webhook delivery"],
+      ["satellite run --target …", "relay public webhooks to a local daemon"],
       ["status", "dashboard: triggers, jobs, upcoming fires"],
       ["ledger [-n <lines>] [--follow]", "stream the event ledger"],
     ]),

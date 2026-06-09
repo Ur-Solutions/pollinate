@@ -5,6 +5,7 @@ import { ScheduleEngine } from "./schedule.js";
 import { PollinateStore } from "./store.js";
 import { WebhookServer } from "./webhook.js";
 import { parseDuration } from "./time.js";
+import { gcTemporaryHooks } from "./hooks.js";
 
 export class PollinateDaemon {
   private delivery?: DeliveryManager;
@@ -20,6 +21,7 @@ export class PollinateDaemon {
   async start(): Promise<void> {
     await this.store.ensure();
     const config = await this.store.daemonConfig();
+    await gcTemporaryHooks(this.store);
     const triggers = await this.store.loadTriggers();
     const executor = new ActionExecutor(this.store, {
       contextTimeoutMs: parseDuration(config.defaults.contextTimeout, 5_000),
@@ -30,7 +32,7 @@ export class PollinateDaemon {
     await this.delivery.init(triggers);
     this.schedule = new ScheduleEngine(this.store, this.delivery, triggers, config.defaults.tickMs);
     this.poll = new PollEngine(this.store, this.delivery, triggers, config.execution);
-    this.webhook = new WebhookServer(this.store, this.delivery, triggers, config.webhook.bind, config.webhook.port);
+    this.webhook = new WebhookServer(this.store, this.delivery, triggers, config.webhook.bind, config.webhook.port, config.webhook.relay);
     await this.schedule.start();
     await this.poll.start();
     await this.webhook.start();
@@ -38,7 +40,13 @@ export class PollinateDaemon {
     this.reloadTimer = setInterval(() => {
       void this.reloadTriggers();
     }, config.defaults.triggerReloadMs);
-    await this.store.appendLedger({ event: "pollinate.daemon.started", trigger_count: triggers.length, webhook_bind: config.webhook.bind, webhook_port: config.webhook.port });
+    await this.store.appendLedger({
+      event: "pollinate.daemon.started",
+      trigger_count: triggers.length,
+      webhook_bind: config.webhook.bind,
+      webhook_port: config.webhook.port,
+      webhook_relay_enabled: Boolean(config.webhook.relay.secret),
+    });
   }
 
   async stop(): Promise<void> {
@@ -55,6 +63,7 @@ export class PollinateDaemon {
   private async reloadTriggers(): Promise<void> {
     if (this.stopping || !this.delivery || !this.schedule || !this.poll || !this.webhook) return;
     try {
+      await gcTemporaryHooks(this.store);
       const triggers = await this.store.loadTriggers();
       const signature = signatureForTriggers(triggers);
       if (signature === this.triggerSignature) return;

@@ -1,8 +1,22 @@
 import { createHmac } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { ActionExecutor, DeliveryManager, detectDelta, fetchPoll, validSignature, applyWebhookTransform, WebhookServer, type CursorState } from "../src/index.js";
+import {
+  ActionExecutor,
+  DeliveryManager,
+  PollEngine,
+  SatelliteServer,
+  WebhookServer,
+  detectDelta,
+  fetchPoll,
+  relaySignatureHeaders,
+  validRelaySignature,
+  validSignature,
+  applyWebhookTransform,
+  type CursorState,
+} from "../src/index.js";
 import { trigger, waitForTerminalJobs, withTempStore } from "./helpers.js";
 
 describe("poll cursors", () => {
@@ -62,9 +76,11 @@ describe("webhooks", () => {
     const raw = Buffer.from(JSON.stringify({ message: { text: "hi", chat: { id: 42 } } }));
     const secret = "secret";
     const signature = `sha256=${createHmac("sha256", secret).update(raw).digest("hex")}`;
+    const vercelSignature = createHmac("sha1", secret).update(raw).digest("hex");
     const spec = { path: "telegram", secret, transform: { text: "$.message.text", chat_id: "$.message.chat.id" } };
 
     expect(validSignature(spec, raw, { "x-pollinate-signature": signature })).toBe(true);
+    expect(validSignature(spec, raw, { "x-vercel-signature": vercelSignature })).toBe(true);
     expect(validSignature(spec, raw, { "x-pollinate-signature": "sha256=00" })).toBe(false);
     expect(applyWebhookTransform(spec, JSON.parse(raw.toString()))).toEqual({ text: "hi", chat_id: 42 });
   });
@@ -101,5 +117,138 @@ describe("webhooks", () => {
         await delivery.shutdown();
       }
     });
+  });
+
+  test("one-shot webhook triggers disable themselves after the first accepted delivery", async () => {
+    await withTempStore(async (store) => {
+      const trig = trigger({
+        id: "one-shot",
+        source: { kind: "webhook", webhook: { path: "tmp/one-shot" } },
+        lifecycle: { temporary: true, maxDeliveries: 1, deliveries: 0 },
+        action: { kind: "emit", subject: "hook", payload: "{{event}}" },
+      });
+      await store.saveTrigger(trig);
+      const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+      const delivery = new DeliveryManager(store, executor);
+      await delivery.init([trig]);
+      const server = new WebhookServer(store, delivery, [trig], "127.0.0.1", 0);
+      await server.start();
+      try {
+        const address = server.address();
+        expect(address).not.toBeNull();
+        const url = `http://127.0.0.1:${address?.port}/hook/tmp/one-shot`;
+
+        const accepted = await fetch(url, { method: "POST", body: JSON.stringify({ ok: true }) });
+        expect(accepted.status).toBe(202);
+        await waitForTerminalJobs(store, 1);
+
+        const updated = await store.requireTrigger("one-shot");
+        expect(updated.enabled).toBe(false);
+        expect(updated.lifecycle).toMatchObject({ temporary: true, maxDeliveries: 1, deliveries: 1 });
+
+        const second = await fetch(url, { method: "POST", body: JSON.stringify({ ok: false }) });
+        expect(second.status).toBe(404);
+      } finally {
+        await server.stop();
+        await delivery.shutdown();
+      }
+    });
+  });
+
+  test("local webhook relay requires satellite signature before dispatching", async () => {
+    await withTempStore(async (store) => {
+      const trig = trigger({
+        id: "relay-hook",
+        source: { kind: "webhook", webhook: { path: "github", secret: "provider" } },
+        action: { kind: "emit", subject: "hook", payload: "{{event}}" },
+      });
+      await store.saveTrigger(trig);
+      const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+      const delivery = new DeliveryManager(store, executor);
+      await delivery.init([trig]);
+      const server = new WebhookServer(store, delivery, [trig], "127.0.0.1", 0, { secret: "relay", maxAgeSeconds: 300 });
+      await server.start();
+      try {
+        const address = server.address();
+        expect(address).not.toBeNull();
+        const url = `http://127.0.0.1:${address?.port}/relay/github`;
+        const body = JSON.stringify({ ok: true });
+        const providerSig = `sha256=${createHmac("sha256", "provider").update(body).digest("hex")}`;
+
+        const invalidRelay = await fetch(url, {
+          method: "POST",
+          body,
+          headers: { "x-hub-signature-256": providerSig, "x-pollinate-relay-signature": "sha256=00" },
+        });
+        expect(invalidRelay.status).toBe(403);
+
+        const validRelay = await fetch(url, {
+          method: "POST",
+          body,
+          headers: { "x-hub-signature-256": providerSig, ...relaySignatureHeaders("relay", "github", Buffer.from(body)) },
+        });
+        expect(validRelay.status).toBe(202);
+        await waitForTerminalJobs(store, 1);
+      } finally {
+        await server.stop();
+        await delivery.shutdown();
+      }
+    });
+  });
+
+  test("satellite forwards public hooks to the local signed relay endpoint", async () => {
+    const received: { url?: string; body?: Buffer; headers?: Record<string, string | string[] | undefined> } = {};
+    const upstream = await new Promise<import("node:http").Server>((resolve) => {
+      const server = createServer((request, response) => {
+        const chunks: Buffer[] = [];
+        request.on("data", (chunk: Buffer) => chunks.push(chunk));
+        request.on("end", () => {
+          received.url = request.url;
+          received.body = Buffer.concat(chunks);
+          received.headers = request.headers;
+          response.writeHead(202, { "content-type": "application/json" });
+          response.end('{"accepted":true}\n');
+        });
+      });
+      server.listen(0, "127.0.0.1", () => resolve(server));
+    });
+    const upstreamAddress = upstream.address();
+    if (!upstreamAddress || typeof upstreamAddress === "string") throw new Error("expected upstream address");
+    const satellite = new SatelliteServer({
+      bind: "127.0.0.1",
+      port: 0,
+      target: `http://127.0.0.1:${upstreamAddress.port}`,
+      relaySecret: "relay",
+    });
+    await satellite.start();
+    try {
+      const address = satellite.address();
+      expect(address).not.toBeNull();
+      const body = Buffer.from(JSON.stringify({ event: "opened" }));
+      const providerSig = `sha256=${createHmac("sha256", "provider").update(body).digest("hex")}`;
+      const vercelSig = createHmac("sha1", "vercel").update(body).digest("hex");
+      const response = await fetch(`http://127.0.0.1:${address?.port}/hook/github`, {
+        method: "POST",
+        body,
+        headers: { "content-type": "application/json", "x-hub-signature-256": providerSig, "x-vercel-signature": vercelSig },
+      });
+
+      expect(response.status).toBe(202);
+      expect(received.url).toBe("/relay/github");
+      expect(received.body?.toString("utf8")).toBe(body.toString("utf8"));
+      expect(received.headers?.["x-hub-signature-256"]).toBe(providerSig);
+      expect(received.headers?.["x-vercel-signature"]).toBe(vercelSig);
+      expect(
+        validRelaySignature({
+          secret: "relay",
+          path: "github",
+          raw: received.body ?? Buffer.alloc(0),
+          headers: received.headers ?? {},
+        }),
+      ).toBe(true);
+    } finally {
+      await satellite.stop();
+      await new Promise<void>((resolve, reject) => upstream.close((error) => (error ? reject(error) : resolve())));
+    }
   });
 });

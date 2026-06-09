@@ -16,14 +16,16 @@ import type {
   ScheduleTiming,
   Source,
   Trigger,
+  TriggerLifecycle,
   WebhookSpec,
+  WebhookRelayConfig,
 } from "./types.js";
 import { parseDuration } from "./time.js";
 
 type AnyRecord = Record<string, unknown>;
 
 export const DEFAULT_DAEMON_CONFIG: DaemonConfig = {
-  webhook: { bind: "127.0.0.1", port: 3978 },
+  webhook: { bind: "127.0.0.1", port: 3978, relay: { maxAgeSeconds: 300 } },
   defaults: { contextTimeout: "5s", commandTimeout: "10m", tickMs: 1_000, triggerReloadMs: 1_000 },
   execution: {
     shell: "/bin/sh",
@@ -47,12 +49,15 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
   if (!text || text.trim() === "") return DEFAULT_DAEMON_CONFIG;
   const doc = parse(text) as AnyRecord;
   const webhook = asOptionalRecord(doc.webhook) ?? {};
+  const relay = asOptionalRecord(webhook.relay) ?? {};
   const defaults = asOptionalRecord(doc.defaults) ?? {};
   const execution = asOptionalRecord(doc.execution) ?? {};
   return {
     webhook: {
       bind: stringOr(webhook.bind, DEFAULT_DAEMON_CONFIG.webhook.bind),
       port: numberOr(webhook.port, DEFAULT_DAEMON_CONFIG.webhook.port),
+      publicUrl: optionalString(webhook.publicUrl ?? webhook.public_url),
+      relay: normalizeWebhookRelay(webhook, relay),
     },
     defaults: {
       contextTimeout: stringOr(defaults.contextTimeout ?? defaults.context_timeout, DEFAULT_DAEMON_CONFIG.defaults.contextTimeout),
@@ -61,6 +66,16 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
       triggerReloadMs: numberOr(defaults.triggerReloadMs ?? defaults.trigger_reload_ms, DEFAULT_DAEMON_CONFIG.defaults.triggerReloadMs),
     },
     execution: normalizeExecution(execution),
+  };
+}
+
+function normalizeWebhookRelay(webhook: AnyRecord, relay: AnyRecord): WebhookRelayConfig {
+  return {
+    secret: optionalString(relay.secret ?? webhook.relaySecret ?? webhook.relay_secret),
+    maxAgeSeconds: numberOr(
+      relay.maxAgeSeconds ?? relay.max_age_seconds ?? webhook.relayMaxAgeSeconds ?? webhook.relay_max_age_seconds,
+      DEFAULT_DAEMON_CONFIG.webhook.relay.maxAgeSeconds,
+    ),
   };
 }
 
@@ -94,9 +109,24 @@ function normalizeTrigger(raw: AnyRecord, fallbackId?: string): Trigger {
     filter: normalizeFilter(asOptionalRecord(raw.filter)),
     delivery,
     context: normalizeContext(asOptionalRecord(raw.context)),
+    lifecycle: normalizeLifecycle(asOptionalRecord(raw.lifecycle)),
     action: normalizeAction(asRecord(raw.action, "trigger.action")),
     createdAt: stringOr(raw.createdAt ?? raw.created_at, now),
     updatedAt: stringOr(raw.updatedAt ?? raw.updated_at, now),
+  };
+}
+
+function normalizeLifecycle(raw: AnyRecord | undefined): TriggerLifecycle | undefined {
+  if (!raw) return undefined;
+  const expiresAt = optionalString(raw.expiresAt ?? raw.expires_at);
+  if (expiresAt && Number.isNaN(new Date(expiresAt).getTime())) throw new Error(`Invalid lifecycle expiresAt: ${expiresAt}`);
+  const maxDeliveries = optionalNumber(raw.maxDeliveries ?? raw.max_deliveries);
+  const deliveries = optionalNumber(raw.deliveries);
+  return {
+    temporary: booleanOr(raw.temporary, false),
+    expiresAt,
+    maxDeliveries: maxDeliveries === undefined ? undefined : Math.max(1, maxDeliveries),
+    deliveries: deliveries === undefined ? undefined : Math.max(0, deliveries),
   };
 }
 
@@ -315,6 +345,7 @@ function stripRuntimeDates(trigger: Trigger): AnyRecord {
     filter: trigger.filter,
     delivery: deliveryToToml(trigger.delivery),
     context: trigger.context,
+    lifecycle: trigger.lifecycle,
     action: trigger.action,
     createdAt: trigger.createdAt,
     updatedAt: trigger.updatedAt,
@@ -368,6 +399,12 @@ function numberOr(value: unknown, fallback: number): number {
   if (typeof value === "bigint") return Number(value);
   if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
   return fallback;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const number = numberOr(value, Number.NaN);
+  return Number.isFinite(number) ? number : undefined;
 }
 
 function stringArray(value: unknown): string[] {

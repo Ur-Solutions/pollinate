@@ -1,10 +1,13 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import http, { IncomingMessage, ServerResponse } from "node:http";
-import type { Activation, JsonObject, JsonValue, Trigger, WebhookSpec } from "./types.js";
+import type { Activation, JsonObject, JsonValue, Trigger, WebhookRelayConfig, WebhookSpec } from "./types.js";
 import { DeliveryManager } from "./delivery.js";
 import { PollinateStore } from "./store.js";
 import { selectJsonPath } from "./jsonpath.js";
 import { nowIso } from "./time.js";
+import { resolveSecret } from "./secrets.js";
+import { validRelaySignature } from "./satellite.js";
+import { expireTemporaryHook, isExpiredTemporaryHook, recordWebhookDelivery } from "./hooks.js";
 
 export class WebhookServer {
   private server?: http.Server;
@@ -15,6 +18,7 @@ export class WebhookServer {
     private triggers: Trigger[],
     private readonly bind: string,
     private readonly port: number,
+    private readonly relay: WebhookRelayConfig = { maxAgeSeconds: 300 },
   ) {}
 
   async start(): Promise<void> {
@@ -69,15 +73,35 @@ export class WebhookServer {
       send(response, 405, { error: "method not allowed" });
       return;
     }
-    const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
-    const path = decodeURIComponent(url.pathname.replace(/^\/hook\/?/, ""));
+    const route = webhookRoute(request);
+    if (!route) {
+      send(response, 404, { error: "hook not found" });
+      return;
+    }
+    const { path } = route;
     const trigger = this.triggers.find((item) => item.enabled && item.source.kind === "webhook" && item.source.webhook.path === path);
     if (!trigger || trigger.source.kind !== "webhook") {
       send(response, 404, { error: "hook not found" });
       return;
     }
+    if (isExpiredTemporaryHook(trigger)) {
+      const expired = await expireTemporaryHook(this.store, trigger);
+      this.replaceTrigger(expired);
+      send(response, 410, { error: "hook expired" });
+      return;
+    }
     const raw = await readBody(request);
     try {
+      if (route.kind === "relay") {
+        if (!this.relay.secret) {
+          send(response, 404, { error: "relay not enabled" });
+          return;
+        }
+        if (!validRelaySignature({ secret: this.relay.secret, maxAgeSeconds: this.relay.maxAgeSeconds, path, raw, headers: request.headers })) {
+          send(response, 403, { error: "invalid relay signature" });
+          return;
+        }
+      }
       if (!validSignature(trigger.source.webhook, raw, request.headers)) {
         send(response, 403, { error: "invalid signature" });
         return;
@@ -93,7 +117,10 @@ export class WebhookServer {
       send(response, 400, { error: "invalid json" });
       return;
     }
+    const dispatchTrigger = trigger;
     const transformed = applyWebhookTransform(trigger.source.webhook, payload);
+    const updated = await recordWebhookDelivery(this.store, trigger);
+    this.replaceTrigger(updated);
     send(response, 202, { accepted: true, trigger_id: trigger.id });
     await this.store.appendLedger({
       event: "pollinate.webhook.received",
@@ -103,13 +130,36 @@ export class WebhookServer {
       at: nowIso(),
       response_ms: Date.now() - started,
     });
-    void this.dispatch(trigger, transformed, request.socket.remoteAddress ?? "unknown");
+    void this.dispatch(dispatchTrigger, transformed, request.socket.remoteAddress ?? "unknown");
   }
 
   private async dispatch(trigger: Trigger, payload: JsonValue, _sourceIp: string): Promise<void> {
     const activation: Activation = { triggerId: trigger.id, source: "webhook", payload, receivedAt: nowIso() };
     await this.delivery.handle(trigger, activation);
   }
+
+  private replaceTrigger(updated: Trigger): void {
+    this.triggers = this.triggers.map((trigger) => (trigger.id === updated.id ? updated : trigger));
+  }
+}
+
+type WebhookRoute = { kind: "hook" | "relay"; path: string };
+
+function webhookRoute(request: IncomingMessage): WebhookRoute | null {
+  const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
+  const hook = routePath(url.pathname, "hook");
+  if (hook) return { kind: "hook", path: hook };
+  const relay = routePath(url.pathname, "relay");
+  if (relay) return { kind: "relay", path: relay };
+  return null;
+}
+
+function routePath(pathname: string, prefix: string): string | null {
+  const marker = `/${prefix}/`;
+  if (!pathname.startsWith(marker)) return null;
+  const raw = pathname.slice(marker.length);
+  if (!raw) return null;
+  return decodeURIComponent(raw).replace(/^\/+/, "");
 }
 
 export function applyWebhookTransform(spec: WebhookSpec, payload: JsonValue): JsonValue {
@@ -125,21 +175,19 @@ export function applyWebhookTransform(spec: WebhookSpec, payload: JsonValue): Js
 export function validSignature(spec: WebhookSpec, raw: Buffer, headers: IncomingMessage["headers"]): boolean {
   if (!spec.secret) return true;
   const secret = resolveSecret(spec.secret);
+  const vercelSignature = headerValue(headers["x-vercel-signature"]);
+  if (vercelSignature) return validHexHmacSignature("sha1", secret, raw, vercelSignature);
   const signature = headerValue(headers["x-pollinate-signature"] ?? headers["x-hub-signature-256"] ?? headers["x-signature"]);
   if (!signature) return false;
-  const expected = createHmac("sha256", secret).update(raw).digest("hex");
-  const received = signature.replace(/^sha256=/, "");
+  return validHexHmacSignature("sha256", secret, raw, signature);
+}
+
+function validHexHmacSignature(algorithm: "sha1" | "sha256", secret: string, raw: Buffer, signature: string): boolean {
+  const expected = createHmac(algorithm, secret).update(raw).digest("hex");
+  const received = signature.replace(/^sha(?:1|256)=/, "");
   const a = Buffer.from(expected, "hex");
   const b = Buffer.from(received, "hex");
   return a.length === b.length && timingSafeEqual(a, b);
-}
-
-function resolveSecret(value: string): string {
-  if (!value.startsWith("env:")) return value;
-  const envName = value.slice("env:".length);
-  const secret = process.env[envName];
-  if (!secret) throw new Error(`Webhook secret env var is not set: ${envName}`);
-  return secret;
 }
 
 function headerValue(value: string | string[] | undefined): string | undefined {

@@ -75,6 +75,13 @@ export type ContextResolver = {
   static?: Record<string, string>;
 };
 
+export type TriggerLifecycle = {
+  temporary?: boolean;
+  expiresAt?: string;
+  maxDeliveries?: number;
+  deliveries?: number;
+};
+
 export type Trigger = {
   id: string;
   name: string;
@@ -86,6 +93,7 @@ export type Trigger = {
   filter?: Filter;
   delivery: Delivery;
   context?: ContextResolver;
+  lifecycle?: TriggerLifecycle;
   action: Action;
   createdAt: string;
   updatedAt: string;
@@ -154,10 +162,17 @@ export type ExecutionProfile = {
   env: Record<string, string>;
 };
 
+export type WebhookRelayConfig = {
+  secret?: string;
+  maxAgeSeconds: number;
+};
+
 export type DaemonConfig = {
   webhook: {
     bind: string;
     port: number;
+    publicUrl?: string;
+    relay: WebhookRelayConfig;
   };
   defaults: {
     contextTimeout: string;

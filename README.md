@@ -94,6 +94,97 @@ pollinate daemon status
 pollinate daemon logs
 ```
 
+## Webhook Satellites
+
+If you do not want public webhooks to hit your workstation directly, run the local
+daemon on loopback and put a stateless satellite on a VPS. The satellite receives
+public `/hook/<path>` requests, forwards the raw body and provider signature headers
+to the local daemon's `/relay/<path>` endpoint, and signs that relay hop with a
+separate Pollinate HMAC.
+
+Local daemon config:
+
+```toml
+[webhook]
+bind = "127.0.0.1"
+port = 3978
+publicUrl = "https://vps.example.com"
+
+[webhook.relay]
+secret = "env:POLLINATE_RELAY_SECRET"
+maxAgeSeconds = 300
+```
+
+Recommended: expose the local loopback daemon privately over Tailscale Serve, then
+run the satellite on the VPS with its target set to the workstation's tailnet name or
+Tailscale IP. This does not require any inbound workstation port or a long-running SSH
+session:
+
+```sh
+# Workstation. Keeps pollinate itself bound to 127.0.0.1.
+tailscale serve --bg --tcp=3978 tcp://127.0.0.1:3978
+```
+
+Then run the satellite on the VPS:
+
+```sh
+POLLINATE_RELAY_SECRET='same-secret-as-local' \
+pollinate satellite run \
+  --bind 0.0.0.0 \
+  --port 3979 \
+  --target http://workstation-name:3978 \
+  --secret env:POLLINATE_RELAY_SECRET
+```
+
+If you do not want to use Tailscale Serve, bind the local daemon to its Tailscale IP
+instead and point the satellite at `http://100.x.y.z:3978`. Use Tailscale ACLs so only
+the satellite node can reach that port.
+
+Fallback without Tailscale is an outbound reverse SSH tunnel from the workstation to
+the VPS:
+
+```sh
+ssh -N -R 127.0.0.1:3978:127.0.0.1:3978 user@vps.example.com
+```
+
+Point providers at `https://vps.example.com/hook/<path>`. Existing webhook trigger
+secrets still validate provider signatures on the local daemon; the relay secret only
+authenticates the satellite-to-daemon hop.
+
+## Temporary Webhook Hooks
+
+Long-lived provider webhooks are just regular webhook triggers created with
+`pollinate create --source webhook`. For short-lived callbacks, Pollinate can create
+temporary webhook triggers with random routes, TTLs, and delivery limits:
+
+```sh
+pollinate hook create callback \
+  --ttl 15m \
+  --once \
+  --action emit \
+  --subject callback.received
+```
+
+If `[webhook].publicUrl` is configured, the command prints a full public URL such as
+`https://vps.example.com/hook/tmp/<token>`. Otherwise use `--base-url`:
+
+```sh
+pollinate hook create callback --ttl 15m --once --base-url https://hooks.example.com
+```
+
+Common patterns are available directly:
+
+```sh
+pollinate hook inbox --ttl 1h
+pollinate hook wait --ttl 10m
+pollinate hook gc
+```
+
+`hook inbox` creates a temporary webhook that emits the received payload.
+`hook wait` creates a one-shot webhook, prints the URL, waits for the first delivery,
+then removes the trigger. `hook gc` removes expired or spent temporary hooks; the
+daemon also runs this cleanup on start and trigger reload.
+
 ## Trigger Example
 
 ```toml
