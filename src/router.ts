@@ -27,9 +27,9 @@ export type RouterEventResult =
 export async function executeRouter(options: ExecuteRouterOptions): Promise<{ plugin: string; events: RouterEventResult[] }> {
   const router = options.trigger.router;
   if (!router) throw new Error(`Trigger ${options.trigger.id} has no router`);
-  const plugin = getRouterPlugin(router.plugin);
+  const plugin = await getRouterPlugin(router.plugin, { root: options.store.root, cwd: options.cwd });
   const input = routerInput(options.activation);
-  const events = plugin.normalize(input);
+  const events = await plugin.normalize(input);
   const results: RouterEventResult[] = [];
   for (const event of events) {
     results.push(await handleRouterEvent(options, router, event));
@@ -111,12 +111,13 @@ async function createBinding(
   try {
     const rendered = renderRouterAction(router.onOpen, event, pending);
     const result = await options.executor.executeAction(rendered, options.cwd);
-    const handle = typeof result.handle === "string" ? result.handle : honeybeeSpawnName(rendered);
+    const handles = result.handles && isStringRecord(result.handles) ? result.handles : undefined;
+    const handle = typeof result.handle === "string" ? result.handle : handles ? Object.values(handles)[0] : honeybeeSpawnName(rendered);
     if (!handle) throw new Error("Router onOpen action did not produce a target handle");
     const active: RouterBinding = {
       ...pending,
       status: "active",
-      target: { kind: "hive", handle },
+      target: { kind: "hive", handle, ...(handles ? { handles } : {}) },
       updatedAt: nowIso(),
       lastActivityAt: nowIso(),
       lastEventKind: event.kind,
@@ -205,6 +206,7 @@ function renderRouterAction(action: Action, event: CanonicalRouterEvent, binding
     binding_id: binding.id,
     target: binding.target?.handle ?? "",
     "binding.target": binding.target?.handle ?? "",
+    ...(binding.target?.handles ? bindingTargetVars(binding.target.handles) : {}),
   };
   return renderAction(action, context).value;
 }
@@ -215,6 +217,15 @@ function defaultCloseAction(): Action {
 
 function honeybeeSpawnName(action: Action): string | undefined {
   return action.kind === "honeybee" && action.run === "spawn" ? action.name : undefined;
+}
+
+function bindingTargetVars(handles: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(handles).map(([key, value]) => [`binding.targets.${key}`, value]));
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.values(value).every((item) => typeof item === "string");
 }
 
 function bindingId(triggerId: string, subjectKey: string): string {

@@ -54,7 +54,35 @@ to PR #2"; Pollinate decides "PR #2 currently maps to bee X".
 
 ## GitHub PR Trigger
 
-Create a trigger file such as:
+The quickest setup is the built-in creator:
+
+```sh
+pollinate github create-pr-router pollinate-pr-router \
+  --repo Ur-Solutions/pollinate \
+  --cwd /Users/me/src/pollinate \
+  --secret env:GITHUB_WEBHOOK_SECRET \
+  --base-url https://hooks.example.com \
+  --install-webhook
+```
+
+That writes the trigger and, when `--install-webhook` is present, creates or
+updates the GitHub repository webhook through `gh api`.
+
+Use repeated `--reviewer id=bee` flags to create a swarm-style router:
+
+```sh
+pollinate github create-pr-router pollinate-pr-router \
+  --repo Ur-Solutions/pollinate \
+  --cwd /Users/me/src/pollinate \
+  --secret env:GITHUB_WEBHOOK_SECRET \
+  --reviewer claude=claude \
+  --reviewer grok=grok
+```
+
+Pollinate stores each spawned handle under `binding.target.handles`, so later
+activity can address `{{binding.targets.claude}}` and `{{binding.targets.grok}}`.
+
+Manual trigger setup is also supported. Create a trigger file such as:
 
 ```text
 ~/.pollinate/triggers/pollinate-pr-router.toml
@@ -142,6 +170,20 @@ check_suite
 Only issue comments that belong to pull requests are routed. Plain issue comments
 are ignored by the `github-pr` plugin.
 
+You can install or update the GitHub webhook for an existing trigger with:
+
+```sh
+pollinate github install-pr-router pollinate-pr-router \
+  --repo Ur-Solutions/pollinate \
+  --base-url https://hooks.example.com
+```
+
+The command uses the trigger's webhook path and secret. If the trigger secret is
+`env:GITHUB_WEBHOOK_SECRET`, that environment variable must be set when installing
+the provider webhook.
+
+Use `--dry-run` to inspect the request without calling `gh api`.
+
 ## Activity Delivery
 
 Use `honeybee` `run = "send"` when the bee must react to new PR activity as a
@@ -204,6 +246,40 @@ subject_key
 
 `{{binding.target}}` is the usual field for `onActivity` and `onClose`.
 
+For sequence/swarm router actions, Pollinate also exposes one field per named
+target:
+
+```text
+binding.targets.<id>
+```
+
+Example:
+
+```toml
+[trigger.router.onActivity]
+kind = "sequence"
+mode = "parallel"
+primary = "claude"
+
+[[trigger.router.onActivity.actions]]
+id = "claude"
+kind = "honeybee"
+run = "send"
+target = "{{binding.targets.claude}}"
+message = "{{activity_markdown}}"
+
+[[trigger.router.onActivity.actions]]
+id = "grok"
+kind = "honeybee"
+run = "send"
+target = "{{binding.targets.grok}}"
+message = "{{activity_markdown}}"
+```
+
+`sequence` actions can be `serial` or `parallel`. When sequence steps produce
+Hive handles, Pollinate records them by step id and uses `primary` as the
+default `{{binding.target}}`.
+
 ## Observability
 
 List active or historical bindings:
@@ -236,15 +312,46 @@ gh pr view 2 --repo Ur-Solutions/pollinate --json number,state,url,comments
 
 ## Adding Another Router Plugin
 
-Routers can be implemented as TypeScript plugins when TOML configuration is not
+Routers can be implemented as user-space plugins when TOML configuration is not
 expressive enough.
+
+Create a plugin scaffold:
+
+```sh
+pollinate routers init linear-review
+pollinate routers list
+```
+
+This writes:
+
+```text
+~/.pollinate/router-plugins/linear-review.mjs
+```
 
 1. Add a plugin that implements `RouterPlugin` from `src/router-plugins/github-pr.ts`.
 2. Normalize provider payloads into `CanonicalRouterEvent` values.
 3. Use a stable subject key that names the external thing being followed.
-4. Register the plugin in `src/router-plugins/index.ts`.
+4. Reference it by name in TOML with `plugin = "linear-review"`.
 5. Add tests for normalization, open/activity routing, close cleanup, and any
    self-output ignore markers.
 
 The router core does not need provider-specific code for new providers. Only the
 plugin needs to know how that provider names subjects and event kinds.
+
+Plugins may export `default`, `routerPlugin`, or `plugin`:
+
+```js
+export default {
+  name: "linear-review",
+  normalize(input) {
+    return [{
+      subjectKey: "linear:issue:" + input.body.issue.id,
+      kind: "linear.issue.commented",
+      payload: {
+        event_kind: "linear.issue.commented",
+        activity_markdown: input.body.comment.body,
+      },
+    }];
+  },
+};
+```

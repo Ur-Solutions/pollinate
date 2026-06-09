@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { PollinateStore } from "./store.js";
 import { ActionExecutor } from "./actions.js";
 import { parseDuration, sleep, nowIso } from "./time.js";
@@ -9,6 +10,10 @@ import { applyWebhookTransform } from "./webhook.js";
 import { runForeground } from "./daemon.js";
 import { SatelliteServer } from "./satellite.js";
 import { createWebhookHook, gcTemporaryHooks, randomHookToken, type HookCreateResult } from "./hooks.js";
+import { atomicWriteFile, pathExists, routerPluginsDir } from "./fsx.js";
+import { listRouterPlugins, routerPluginTemplate } from "./router-plugins/index.js";
+import { GITHUB_PR_ROUTER_EVENTS, installGithubWebhook } from "./providers/github.js";
+import { resolveSecret } from "./secrets.js";
 import {
   daemonLogs,
   daemonStatus,
@@ -91,6 +96,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     case "bindings":
       await cmdBindings(await getStore(), args);
       return;
+    case "routers":
+      await cmdRouters(await getStore(), args);
+      return;
     case "job":
       await cmdJob(await getStore(), args);
       return;
@@ -105,6 +113,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       return;
     case "satellite":
       await cmdSatellite(args);
+      return;
+    case "github":
+      await cmdGithub(await getStore(), args);
       return;
     case "status":
       await cmdStatus(await getStore(), args);
@@ -293,6 +304,30 @@ async function cmdBindings(store: PollinateStore, args: ParsedArgs): Promise<voi
   print(args, bindings, renderBindingList(bindings));
 }
 
+async function cmdRouters(store: PollinateStore, args: ParsedArgs): Promise<void> {
+  const sub = args.rest[0] ?? "list";
+  if (sub === "list") {
+    const plugins = await listRouterPlugins({ root: store.root });
+    print(args, plugins, renderRouterPluginList(plugins));
+    return;
+  }
+  if (sub === "init") {
+    const name = slugify(requiredArg(args.rest[1], "Usage: pollinate routers init <name> [--force]"));
+    const path = join(routerPluginsDir(store.root), `${name}.mjs`);
+    if ((await pathExists(path)) && !args.flags.force) throw new Error(`Router plugin already exists: ${path}`);
+    await atomicWriteFile(path, routerPluginTemplate(name), { mode: 0o600 });
+    await store.appendLedger({ event: "pollinate.router.plugin.created", plugin: name, path });
+    print(args, { name, path }, `${say.ok(`created router plugin ${c.bold(name)}`)}\n  ${c.dim(path)}`);
+    return;
+  }
+  throw new Error("Usage: pollinate routers [list] | routers init <name>");
+}
+
+function renderRouterPluginList(plugins: string[]): string {
+  if (!plugins.length) return c.dim("No router plugins found.");
+  return table(plugins.map((plugin) => [c.bold(plugin)]), { head: ["router"] });
+}
+
 type BindingRow = Awaited<ReturnType<PollinateStore["listRouterBindings"]>>[number];
 
 function renderBindingList(bindings: BindingRow[]): string {
@@ -318,6 +353,7 @@ function renderBinding(binding: BindingRow): string {
       ["subject", binding.subjectKey],
       ["status", binding.status],
       binding.target ? ["target", `${binding.target.kind}:${binding.target.handle}`] : null,
+      binding.target?.handles ? ["targets", Object.entries(binding.target.handles).map(([id, handle]) => `${id}=${handle}`).join(", ")] : null,
       binding.lastEventKind ? ["last event", binding.lastEventKind] : null,
       binding.error ? ["error", c.red(binding.error)] : null,
     ]),
@@ -627,6 +663,245 @@ async function cmdSatellite(args: ParsedArgs): Promise<void> {
   await new Promise<void>(() => undefined);
 }
 
+async function cmdGithub(store: PollinateStore, args: ParsedArgs): Promise<void> {
+  const sub = requiredArg(args.rest[0], "Usage: pollinate github <install-pr-router|create-pr-router> ...");
+  if (sub === "install-pr-router") {
+    await cmdGithubInstallPrRouter(store, args);
+    return;
+  }
+  if (sub === "create-pr-router") {
+    await cmdGithubCreatePrRouter(store, args);
+    return;
+  }
+  throw new Error("Usage: pollinate github <install-pr-router|create-pr-router> ...");
+}
+
+async function cmdGithubInstallPrRouter(store: PollinateStore, args: ParsedArgs): Promise<void> {
+  const triggerId = requiredArg(args.rest[1], "Usage: pollinate github install-pr-router <trigger-id> --repo owner/repo [--base-url https://...]");
+  const trigger = await store.requireTrigger(triggerId);
+  if (trigger.source.kind !== "webhook") throw new Error(`Trigger ${trigger.id} is not a webhook trigger`);
+  if (!trigger.router) throw new Error(`Trigger ${trigger.id} is not a router trigger`);
+  const config = await store.daemonConfig();
+  const dryRun = Boolean(args.flags["dry-run"]);
+  const url = githubWebhookUrl(args, config.webhook.publicUrl, trigger.source.webhook.path);
+  const secretRaw = stringFlag(args, "secret") ?? trigger.source.webhook.secret;
+  const result = await installGithubWebhook({
+    repo: requiredFlag(args, "repo", "GitHub PR router install requires --repo owner/repo"),
+    url,
+    secret: dryRun || !secretRaw ? secretRaw : resolveSecret(secretRaw),
+    events: flagValues(args, "event"),
+    dryRun,
+    timeoutMs: parseDuration(stringFlag(args, "timeout"), 60_000),
+    execution: (await store.daemonConfig()).execution,
+  });
+  if (!dryRun) {
+    await store.appendLedger({
+      event: "pollinate.github.webhook.installed",
+      trigger_id: trigger.id,
+      repo: result.repo,
+      url: result.url,
+      action: result.action,
+      hook_id: result.hookId,
+    });
+  }
+  print(args, result, renderGithubWebhookInstall(result));
+}
+
+async function cmdGithubCreatePrRouter(store: PollinateStore, args: ParsedArgs): Promise<void> {
+  const id = slugify(requiredArg(args.rest[1], "Usage: pollinate github create-pr-router <id> --repo owner/repo [--cwd <repo-dir>]"));
+  const repo = requiredFlag(args, "repo", "GitHub PR router creation requires --repo owner/repo");
+  const dryRun = Boolean(args.flags["dry-run"]);
+  const now = nowIso();
+  const trigger = githubPrRouterTrigger({
+    id,
+    repo,
+    cwd: stringFlag(args, "cwd") ?? process.cwd(),
+    path: stringFlag(args, "path") ?? `github/${repo.replace(/[^A-Za-z0-9_.-]+/g, "-")}/pr`,
+    secret: stringFlag(args, "secret"),
+    reviewers: reviewersFromFlags(args),
+    tags: flagValues(args, "tag"),
+    now,
+  });
+  let install: Awaited<ReturnType<typeof installGithubWebhook>> | undefined;
+  if (!dryRun) {
+    await store.saveTrigger(trigger);
+    await store.appendLedger({ event: "pollinate.trigger.added", trigger_id: trigger.id, via: "github-create-pr-router", repo });
+  }
+  if (args.flags["install-webhook"]) {
+    const config = await store.daemonConfig();
+    const url = githubWebhookUrl(args, config.webhook.publicUrl, trigger.source.kind === "webhook" ? trigger.source.webhook.path : "");
+    const secretRaw = trigger.source.kind === "webhook" ? trigger.source.webhook.secret : undefined;
+    install = await installGithubWebhook({
+      repo,
+      url,
+      secret: dryRun || !secretRaw ? secretRaw : resolveSecret(secretRaw),
+      events: flagValues(args, "event"),
+      dryRun,
+      timeoutMs: parseDuration(stringFlag(args, "timeout"), 60_000),
+      execution: (await store.daemonConfig()).execution,
+    });
+    if (!dryRun) {
+      await store.appendLedger({
+        event: "pollinate.github.webhook.installed",
+        trigger_id: trigger.id,
+        repo: install.repo,
+        url: install.url,
+        action: install.action,
+        hook_id: install.hookId,
+      });
+    }
+  }
+  const payload = install ? { trigger, webhook: install } : { trigger };
+  const human = [
+    dryRun ? say.warn(`dry run for ${c.bold(trigger.id)}`) : say.ok(`created ${c.bold(trigger.id)}`),
+    c.dim(triggerSummary(trigger)),
+    install ? renderGithubWebhookInstall(install) : say.hint(`install webhook with ${c.bold(`pol github install-pr-router ${trigger.id} --repo ${repo}`)}`),
+  ].join("\n");
+  print(args, payload, human);
+}
+
+type ReviewerSpec = { id: string; bee: string };
+
+function reviewersFromFlags(args: ParsedArgs): ReviewerSpec[] {
+  const values = [...flagValues(args, "reviewer"), ...flagValues(args, "review-bee")];
+  if (!values.length) return [{ id: "reviewer", bee: stringFlag(args, "bee") ?? "codex" }];
+  return values.map((value) => {
+    const [id, bee] = splitKeyValue(value);
+    return { id: slugify(id), bee };
+  });
+}
+
+function githubPrRouterTrigger(input: {
+  id: string;
+  repo: string;
+  cwd: string;
+  path: string;
+  secret?: string;
+  reviewers: ReviewerSpec[];
+  tags: string[];
+  now: string;
+}): Trigger {
+  const reviewers = input.reviewers.length ? input.reviewers : [{ id: "reviewer", bee: "codex" }];
+  const swarm = reviewers.length > 1;
+  const spawnArgs = ["--allowedTools", "Bash(gh pr view *),Bash(gh pr diff *),Bash(gh pr comment *),Read,Grep,Glob,LS"];
+  return {
+    id: input.id,
+    name: input.id,
+    description: `Professional PR review router for ${input.repo}`,
+    cwd: input.cwd,
+    tags: ["github", "pr-router", "review", ...input.tags],
+    enabled: true,
+    source: { kind: "webhook", webhook: { path: input.path, ...(input.secret ? { secret: input.secret } : {}) } },
+    delivery: { mode: { strategy: "immediate" }, maxConcurrent: 4 },
+    router: {
+      plugin: "github-pr",
+      openOn: ["github.pull_request.opened", "github.pull_request.reopened", "github.pull_request.ready_for_review"],
+      closeOn: ["github.pull_request.closed", "github.pull_request.merged"],
+      onOpen: swarm
+        ? {
+            kind: "sequence",
+            mode: "parallel",
+            primary: reviewers[0]!.id,
+            actions: reviewers.map((reviewer) => ({
+              id: reviewer.id,
+              action: {
+                kind: "honeybee",
+                run: "spawn",
+                bee: reviewer.bee,
+                name: `${input.id}-${reviewer.id}-{{pr_number}}`,
+                cwd: input.cwd,
+                yolo: false,
+                args: spawnArgs,
+                message: professionalOpenPrompt(reviewer.id),
+              },
+            })),
+          }
+        : {
+            kind: "honeybee",
+            run: "spawn",
+            bee: reviewers[0]!.bee,
+            name: `${input.id}-{{pr_number}}`,
+            cwd: input.cwd,
+            yolo: false,
+            args: spawnArgs,
+            message: professionalOpenPrompt(reviewers[0]!.id),
+          },
+      onActivity: swarm
+        ? {
+            kind: "sequence",
+            mode: "parallel",
+            primary: reviewers[0]!.id,
+            actions: reviewers.map((reviewer) => ({
+              id: reviewer.id,
+              action: {
+                kind: "honeybee",
+                run: "send",
+                target: `{{binding.targets.${reviewer.id}}}`,
+                message: professionalActivityPrompt(reviewer.id),
+              },
+            })),
+          }
+        : {
+            kind: "honeybee",
+            run: "send",
+            target: "{{binding.target}}",
+            message: professionalActivityPrompt(reviewers[0]!.id),
+          },
+      onClose: swarm
+        ? {
+            kind: "sequence",
+            mode: "parallel",
+            primary: reviewers[0]!.id,
+            continueOnError: true,
+            actions: reviewers.map((reviewer) => ({
+              id: reviewer.id,
+              action: { kind: "honeybee", run: "kill", target: `{{binding.targets.${reviewer.id}}}` },
+            })),
+          }
+        : { kind: "honeybee", run: "kill", target: "{{binding.target}}" },
+    },
+    createdAt: input.now,
+    updatedAt: input.now,
+  };
+}
+
+function professionalOpenPrompt(reviewerId: string): string {
+  return [
+    `You are reviewer ${reviewerId} for PR {{repo}}#{{pr_number}}: {{pr_title}}.`,
+    "Perform a professional code review. Inspect PR metadata and diff with gh.",
+    "Focus on correctness, regressions, security, data loss, concurrency, API compatibility, and missing tests.",
+    "Do not modify code. Post a concise PR comment only when you have useful findings or a clear review result.",
+    "If you post a PR comment, include <!-- pollinate-router --> at the top.",
+  ].join(" ");
+}
+
+function professionalActivityPrompt(reviewerId: string): string {
+  return [
+    `Reviewer ${reviewerId}: new activity arrived for PR {{repo}}#{{pr_number}}.`,
+    "{{activity_markdown}}",
+    "Re-check only what changed or what the activity asks for. Do not modify code.",
+    "If you post a PR comment, include <!-- pollinate-router --> at the top.",
+  ].join("\n\n");
+}
+
+function githubWebhookUrl(args: ParsedArgs, configuredPublicUrl: string | undefined, path: string): string {
+  const explicit = stringFlag(args, "url");
+  if (explicit) return explicit;
+  const baseUrl = stringFlag(args, "base-url") ?? configuredPublicUrl;
+  if (!baseUrl) throw new Error("GitHub webhook install requires --url or --base-url, or [webhook].publicUrl in pollinate.toml");
+  return `${baseUrl.replace(/\/+$/, "")}/hook/${path.replace(/^\/+/, "")}`;
+}
+
+function renderGithubWebhookInstall(result: Awaited<ReturnType<typeof installGithubWebhook>>): string {
+  const status = result.action === "dry-run" ? say.warn("dry-run github webhook") : say.ok(`${result.action} github webhook`);
+  return [
+    `${status}  ${c.bold(result.repo)}`,
+    `  ${field("url", c.cyan(result.url))}`,
+    `  ${field("events", result.events.join(", "))}`,
+    result.hookId ? `  ${field("hook", String(result.hookId))}` : `  ${field("hook", c.dim("-"))}`,
+  ].join("\n");
+}
+
 async function cmdStatus(store: PollinateStore, args: ParsedArgs): Promise<void> {
   const [triggers, jobs, scheduleState, deliveryState] = await Promise.all([
     store.loadTriggers(),
@@ -845,6 +1120,8 @@ function describeAction(action: Action): string {
       if (action.run === "flow") return `${c.bold("honeybee")} flow ${action.flow}`;
       if (action.run === "loop") return `${c.bold("honeybee")} loop`;
       return `${c.bold("honeybee")} ${action.run}`;
+    case "sequence":
+      return `${c.bold("sequence")} ${action.mode ?? "serial"} ${c.dim(`${action.actions.length} actions`)}`;
     default:
       return (action as { kind: string }).kind;
   }
@@ -859,6 +1136,7 @@ function actionDetail(action: Action): string | undefined {
   if (action.kind === "command") return truncate(action.command, max);
   if (action.kind === "http" && action.body) return truncate(action.body, max);
   if ((action.kind === "emit" || action.kind === "hermes") && action.payload) return truncate(action.payload, max);
+  if (action.kind === "sequence") return action.actions.map((step) => step.id ?? step.action.kind).join(", ");
   return undefined;
 }
 
@@ -1256,7 +1534,21 @@ function optionalFlagValue(key: string, next: string | undefined, consume: (valu
 }
 
 function flagValue(key: string, argv: string[], consume: () => string): string | boolean {
-  const booleanFlags = new Set(["json", "enabled", "disabled", "dry-run", "follow", "foreground", "collect", "yolo", "no-yolo", "accept-trust", "no-accept-trust"]);
+  const booleanFlags = new Set([
+    "json",
+    "enabled",
+    "disabled",
+    "dry-run",
+    "follow",
+    "foreground",
+    "collect",
+    "force",
+    "install-webhook",
+    "yolo",
+    "no-yolo",
+    "accept-trust",
+    "no-accept-trust",
+  ]);
   if (booleanFlags.has(key)) return true;
   const value = consume();
   if (value === undefined || value.startsWith("-")) throw new Error(`--${key} requires a value`);
@@ -1351,6 +1643,8 @@ async function printHelp(): Promise<void> {
       ["job <jobId> | job cancel <id>", "inspect or cancel a job"],
       ["bindings [--trigger <id>]", "list router subject→target bindings"],
       ["bindings get <id>", "inspect a router binding"],
+      ["routers [list]", "list built-in and user-space router plugins"],
+      ["routers init <name>", "create ~/.pollinate/router-plugins/<name>.mjs"],
       ["hooks", "list webhook endpoints"],
       ["hook create <id> [--ttl 10m]", "create a temporary webhook URL"],
       ["hook inbox [id]", "create a temporary emit-only webhook"],
@@ -1358,6 +1652,8 @@ async function printHelp(): Promise<void> {
       ["hook gc", "remove expired or spent temporary hooks"],
       ["hook test <id> --payload …", "simulate a webhook delivery"],
       ["satellite run --target …", "relay public webhooks to a local daemon"],
+      ["github create-pr-router <id>", "create a professional GitHub PR review router"],
+      ["github install-pr-router <id>", "create or update the GitHub webhook"],
       ["status", "dashboard: triggers, jobs, upcoming fires"],
       ["ledger [-n <lines>] [--follow]", "stream the event ledger"],
     ]),
@@ -1382,6 +1678,7 @@ async function printHelp(): Promise<void> {
     ["--action command", "--command 'echo {{event}}'"],
     ["--action http", "--method POST --url https://… [--body '{{event}}']"],
     ["--action emit", "--subject some.event [--payload '{\"k\":\"{{var}}\"}']"],
+    ["--action-json", "supports kind=sequence for serial/parallel action orchestration"],
     ["--router-json", "configure a router trigger from JSON"],
   ];
   const scWidth = Math.max(...shortcuts.map(([k]) => k.length));

@@ -83,6 +83,71 @@ target = "{{binding.target}}"
     expect(triggerToToml(trigger)).toContain('plugin = "github-pr"');
   });
 
+  test("parses sequence actions for router swarms", () => {
+    const trigger = parseTriggerToml(`
+[trigger]
+id = "github-pr-swarm"
+name = "GitHub PR swarm"
+enabled = true
+
+[trigger.source]
+kind = "webhook"
+[trigger.source.webhook]
+path = "github/pr"
+
+[trigger.delivery]
+mode = "immediate"
+maxConcurrent = 4
+
+[trigger.router]
+plugin = "github-pr"
+openOn = ["github.pull_request.opened"]
+closeOn = ["github.pull_request.closed"]
+
+[trigger.router.onOpen]
+kind = "sequence"
+mode = "parallel"
+primary = "claude"
+
+[[trigger.router.onOpen.actions]]
+id = "claude"
+kind = "honeybee"
+run = "spawn"
+bee = "claude"
+name = "claude-{{pr_number}}"
+
+[[trigger.router.onOpen.actions]]
+id = "grok"
+kind = "honeybee"
+run = "spawn"
+bee = "grok"
+name = "grok-{{pr_number}}"
+
+[trigger.router.onActivity]
+kind = "sequence"
+mode = "parallel"
+
+[[trigger.router.onActivity.actions]]
+id = "claude"
+kind = "honeybee"
+run = "send"
+target = "{{binding.targets.claude}}"
+message = "{{activity_markdown}}"
+
+[[trigger.router.onActivity.actions]]
+id = "grok"
+kind = "honeybee"
+run = "send"
+target = "{{binding.targets.grok}}"
+message = "{{activity_markdown}}"
+`);
+
+    expect(trigger.router?.onOpen.kind).toBe("sequence");
+    if (trigger.router?.onOpen.kind !== "sequence") throw new Error("expected sequence");
+    expect(trigger.router.onOpen.actions.map((step) => step.id)).toEqual(["claude", "grok"]);
+    expect(triggerToToml(trigger)).toContain('kind = "sequence"');
+  });
+
   test("computes cron and interval next fires", () => {
     const next = nextCronFireAfter("0 8 * * 1-5", new Date("2026-06-08T05:59:00.000Z"), "Europe/Oslo");
     expect(next.toISOString()).toBe("2026-06-08T06:00:00.000Z");

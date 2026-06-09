@@ -76,8 +76,14 @@ export type HoneybeeAction =
   | { kind: "honeybee"; run: "buz"; target: string; message: string; tier?: BuzTier; subject?: string; senderHuman?: string; timeout?: string }
   | { kind: "honeybee"; run: "kill"; target: string; timeout?: string };
 
+export type ActionStep = {
+  id?: string;
+  action: Action;
+};
+
 export type Action =
   | HoneybeeAction
+  | { kind: "sequence"; mode?: "serial" | "parallel"; primary?: string; continueOnError?: boolean; actions: ActionStep[] }
   | { kind: "command"; command: string; cwd?: string; timeout?: string }
   | { kind: "http"; method: string; url: string; headers?: Record<string, string>; body?: string; timeout?: string }
   | { kind: "hermes"; invoke: string; payload?: string; timeout?: string }
@@ -180,6 +186,7 @@ export type RouterBindingStatus = "pending" | "active" | "closing" | "closed" | 
 export type RouterBindingTarget = {
   kind: "hive";
   handle: string;
+  handles?: Record<string, string>;
 };
 
 export type RouterBinding = {

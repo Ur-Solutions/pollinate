@@ -159,6 +159,51 @@ describe("CLI", () => {
     });
   });
 
+  test("routers init scaffolds a user-space router plugin", async () => {
+    await withTempStore(async (_store, root) => {
+      const env = { ...process.env, POLLINATE_STORE_ROOT: root };
+      const cli = join(process.cwd(), "dist", "cli.js");
+      const created = await execFileAsync(process.execPath, [cli, "routers", "init", "linear-review", "--json"], { env });
+      const result = JSON.parse(created.stdout);
+      expect(result.path).toBe(join(root, "router-plugins", "linear-review.mjs"));
+      expect(await import("node:fs/promises").then((fs) => fs.readFile(result.path, "utf8"))).toContain('name: "linear-review"');
+
+      const listed = await execFileAsync(process.execPath, [cli, "routers", "list", "--json"], { env });
+      expect(JSON.parse(listed.stdout)).toContain("linear-review");
+    });
+  });
+
+  test("github create-pr-router can generate a dry-run swarm trigger", async () => {
+    await withTempStore(async (_store, root) => {
+      const env = { ...process.env, POLLINATE_STORE_ROOT: root };
+      const cli = join(process.cwd(), "dist", "cli.js");
+      const created = await execFileAsync(
+        process.execPath,
+        [
+          cli,
+          "github",
+          "create-pr-router",
+          "pollinate-pr-router",
+          "--repo",
+          "trmd/pollinate",
+          "--cwd",
+          root,
+          "--reviewer",
+          "claude=claude",
+          "--reviewer",
+          "grok=grok",
+          "--dry-run",
+          "--json",
+        ],
+        { env },
+      );
+      const result = JSON.parse(created.stdout);
+      expect(result.trigger.router.plugin).toBe("github-pr");
+      expect(result.trigger.router.onOpen).toMatchObject({ kind: "sequence", mode: "parallel", primary: "claude" });
+      expect(result.trigger.router.onActivity.actions[1].action.target).toBe("{{binding.targets.grok}}");
+    });
+  });
+
   test("hook create builds a temporary one-shot webhook with an unguessable URL", async () => {
     await withTempStore(async (store, root) => {
       const env = { ...process.env, POLLINATE_STORE_ROOT: root };

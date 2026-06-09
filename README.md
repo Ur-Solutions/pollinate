@@ -23,6 +23,7 @@ pollinate --help
 
 ```text
 triggers/<id>.toml
+router-plugins/<name>.mjs
 state/schedule-state.json
 state/delivery-state.json
 state/cursors.json
@@ -229,6 +230,21 @@ the binding state and target lifecycle; router plugins only normalize payloads.
 See [docs/pr-router.md](docs/pr-router.md) for the full GitHub PR review setup,
 binding lifecycle, and verification commands.
 
+The fastest path for GitHub PR review automation is:
+
+```sh
+pollinate github create-pr-router pollinate-pr-router \
+  --repo Ur-Solutions/pollinate \
+  --cwd /Users/me/src/pollinate \
+  --secret env:GITHUB_WEBHOOK_SECRET \
+  --base-url https://hooks.example.com \
+  --install-webhook
+```
+
+User-space router plugins can be scaffolded with `pollinate routers init <name>`.
+Pollinate loads built-ins by name and local modules from
+`~/.pollinate/router-plugins/<name>.mjs`.
+
 ```toml
 [trigger]
 id = "github-pr-events"
@@ -276,6 +292,7 @@ Inspect runtime subject-to-target bindings with:
 ```sh
 pollinate bindings
 pollinate bindings get <binding-id>
+pollinate routers list
 ```
 
 Use `honeybee` `run = "send"` for activity that must wake the target bee and

@@ -2,6 +2,7 @@ import { basename, extname } from "node:path";
 import { parse, stringify } from "smol-toml";
 import type {
   Action,
+  ActionStep,
   BuzTier,
   ContextSource,
   ContextResolver,
@@ -314,6 +315,21 @@ function normalizeRouter(raw: AnyRecord | undefined): RouterConfig | undefined {
 
 function normalizeAction(raw: AnyRecord): Action {
   const kind = stringOr(raw.kind, "");
+  if (kind === "sequence") {
+    const mode = optionalString(raw.mode) ?? "serial";
+    if (mode !== "serial" && mode !== "parallel") throw new Error(`Unsupported sequence mode: ${mode}`);
+    const actions = Array.isArray(raw.actions)
+      ? raw.actions.map((entry, index) => normalizeActionStep(asRecord(entry, `trigger.action.actions[${index}]`)))
+      : [];
+    if (actions.length === 0) throw new Error("Sequence actions require at least one action");
+    return {
+      kind,
+      mode,
+      primary: optionalString(raw.primary),
+      continueOnError: optionalBoolean(raw.continueOnError ?? raw.continue_on_error),
+      actions,
+    };
+  }
   if (kind === "command") {
     return {
       kind,
@@ -389,6 +405,21 @@ function normalizeAction(raw: AnyRecord): Action {
     return { kind, subject: requiredString(raw.subject, "trigger.action.subject"), payload: optionalString(raw.payload) };
   }
   throw new Error(`Unsupported action kind: ${kind || "(missing)"}`);
+}
+
+function normalizeActionStep(raw: AnyRecord): ActionStep {
+  const nested = asOptionalRecord(raw.action);
+  const actionRaw = nested ?? withoutStepOnlyFields(raw);
+  return {
+    id: optionalString(raw.id),
+    action: normalizeAction(actionRaw),
+  };
+}
+
+function withoutStepOnlyFields(raw: AnyRecord): AnyRecord {
+  const copy: AnyRecord = { ...raw };
+  delete copy.id;
+  return copy;
 }
 
 function eventList(value: unknown, label: string): string[] {

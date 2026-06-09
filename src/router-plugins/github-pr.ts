@@ -8,7 +8,7 @@ export type RouterPluginInput = {
 
 export type RouterPlugin = {
   name: string;
-  normalize(input: RouterPluginInput): CanonicalRouterEvent[];
+  normalize(input: RouterPluginInput): CanonicalRouterEvent[] | Promise<CanonicalRouterEvent[]>;
 };
 
 type AnyRecord = Record<string, unknown>;

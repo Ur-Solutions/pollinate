@@ -12,7 +12,7 @@ export type ActionExecutorOptions = {
   execution?: ExecutionProfile;
 };
 
-export type ActionResult = { timedOut?: boolean; [key: string]: unknown };
+export type ActionResult = { timedOut?: boolean; handle?: string; handles?: Record<string, string>; [key: string]: unknown };
 
 export class ActionExecutor {
   constructor(
@@ -167,6 +167,9 @@ export class ActionExecutor {
   }
 
   async executeAction(action: Action, cwd?: string): Promise<ActionResult> {
+    if (action.kind === "sequence") {
+      return this.executeSequence(action, cwd);
+    }
     if (action.kind === "command") {
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
       const result = await execShell(action.command, { cwd: action.cwd ?? cwd, timeoutMs, execution: this.options.execution });
@@ -212,6 +215,39 @@ export class ActionExecutor {
     }
     const neverAction: never = action;
     throw new Error(`Unsupported action: ${JSON.stringify(neverAction)}`);
+  }
+
+  private async executeSequence(action: Extract<Action, { kind: "sequence" }>, cwd?: string): Promise<ActionResult> {
+    const continueOnError = action.continueOnError === true;
+    const runStep = async (step: (typeof action.actions)[number], index: number) => {
+      const id = step.id ?? String(index + 1);
+      try {
+        const result = await this.executeAction(step.action, cwd);
+        return { id, action: step.action.kind, result };
+      } catch (error) {
+        if (!continueOnError) throw error;
+        return { id, action: step.action.kind, error: error instanceof Error ? error.message : String(error) };
+      }
+    };
+    const results =
+      action.mode === "parallel"
+        ? await Promise.all(action.actions.map((step, index) => runStep(step, index)))
+        : await runSequence(action.actions, runStep);
+    const handles: Record<string, string> = {};
+    for (const step of results) {
+      const result = "result" in step ? step.result : undefined;
+      if (!result) continue;
+      if (typeof result.handle === "string") handles[step.id] = result.handle;
+      if (result.handles) {
+        for (const [key, value] of Object.entries(result.handles)) handles[key] = value;
+      }
+    }
+    const handle = (action.primary ? handles[action.primary] : undefined) ?? Object.values(handles)[0];
+    return {
+      results,
+      ...(Object.keys(handles).length ? { handles } : {}),
+      ...(handle ? { handle } : {}),
+    };
   }
 
   private executeHoneybee(action: Extract<Action, { kind: "honeybee" }>, cwd?: string): Promise<ActionResult> {
@@ -330,6 +366,12 @@ export class ActionExecutor {
       return { ...result };
     });
   }
+}
+
+async function runSequence<T, R>(items: T[], fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const out: R[] = [];
+  for (let index = 0; index < items.length; index += 1) out.push(await fn(items[index]!, index));
+  return out;
 }
 
 function flagsFromRecord(record: Record<string, JsonValue | undefined>): string[] {
