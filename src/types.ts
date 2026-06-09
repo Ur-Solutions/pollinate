@@ -53,9 +53,15 @@ export type Delivery = {
   maxConcurrent: number;
 };
 
+export type BuzTier = "interrupt" | "queue" | "passive";
+
 export type HoneybeeAction =
   | { kind: "honeybee"; run: "flow"; flow: string; args?: Record<string, string> }
-  | { kind: "honeybee"; run: "loop"; loop: Record<string, JsonValue> };
+  | { kind: "honeybee"; run: "loop"; loop: Record<string, JsonValue> }
+  | { kind: "honeybee"; run: "spawn"; bee: string; name?: string; colony?: string; cwd?: string; message?: string; timeout?: string }
+  | { kind: "honeybee"; run: "send"; target: string; message: string; timeout?: string }
+  | { kind: "honeybee"; run: "buz"; target: string; message: string; tier?: BuzTier; subject?: string; senderHuman?: string; timeout?: string }
+  | { kind: "honeybee"; run: "kill"; target: string; timeout?: string };
 
 export type Action =
   | HoneybeeAction

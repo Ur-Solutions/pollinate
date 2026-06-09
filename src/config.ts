@@ -2,6 +2,7 @@ import { basename, extname } from "node:path";
 import { parse, stringify } from "smol-toml";
 import type {
   Action,
+  BuzTier,
   ContextSource,
   ContextResolver,
   DaemonConfig,
@@ -315,6 +316,42 @@ function normalizeAction(raw: AnyRecord): Action {
     if (run === "loop") {
       return { kind, run, loop: (asOptionalRecord(raw.loop) ?? {}) as Record<string, JsonValue> };
     }
+    if (run === "spawn") {
+      return {
+        kind,
+        run,
+        bee: requiredString(raw.bee, "trigger.action.bee"),
+        name: optionalString(raw.name),
+        colony: optionalString(raw.colony),
+        cwd: optionalString(raw.cwd),
+        message: optionalString(raw.message ?? raw.prompt),
+        timeout: optionalString(raw.timeout),
+      };
+    }
+    if (run === "send") {
+      return {
+        kind,
+        run,
+        target: requiredString(raw.target, "trigger.action.target"),
+        message: requiredString(raw.message ?? raw.prompt, "trigger.action.message"),
+        timeout: optionalString(raw.timeout),
+      };
+    }
+    if (run === "buz") {
+      return {
+        kind,
+        run,
+        target: requiredString(raw.target, "trigger.action.target"),
+        message: requiredString(raw.message ?? raw.prompt, "trigger.action.message"),
+        tier: normalizeBuzTier(raw.tier),
+        subject: optionalString(raw.subject),
+        senderHuman: optionalString(raw.senderHuman ?? raw.sender_human),
+        timeout: optionalString(raw.timeout),
+      };
+    }
+    if (run === "kill") {
+      return { kind, run, target: requiredString(raw.target, "trigger.action.target"), timeout: optionalString(raw.timeout) };
+    }
     throw new Error(`Unsupported honeybee run mode: ${run || "(missing)"}`);
   }
   if (kind === "hermes") {
@@ -324,6 +361,19 @@ function normalizeAction(raw: AnyRecord): Action {
     return { kind, subject: requiredString(raw.subject, "trigger.action.subject"), payload: optionalString(raw.payload) };
   }
   throw new Error(`Unsupported action kind: ${kind || "(missing)"}`);
+}
+
+function eventList(value: unknown, label: string): string[] {
+  const list = stringArray(value).filter((item) => item.length > 0);
+  if (list.length === 0) throw new Error(`Missing required event list: ${label}`);
+  return list;
+}
+
+function normalizeBuzTier(value: unknown): BuzTier | undefined {
+  if (value === undefined) return undefined;
+  const tier = String(value);
+  if (tier === "interrupt" || tier === "queue" || tier === "passive") return tier;
+  throw new Error(`Unsupported buz tier: ${tier}`);
 }
 
 function normalizeMissedFirePolicy(value: unknown): ScheduleTiming["missedFirePolicy"] | undefined {

@@ -170,20 +170,86 @@ export class ActionExecutor {
         return { ...result };
       });
     }
-    const loop = cwd && !Object.prototype.hasOwnProperty.call(action.loop, "cwd") ? { ...action.loop, cwd } : action.loop;
-    const flags = Object.entries(loop).flatMap(([key, value]) => {
-      const flag = `--${key.replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)}`;
-      if (typeof value === "boolean") return value ? [flag] : [];
-      return [flag, String(value)];
-    });
-    return execShell(["hive", "loop", "start", ...flags.map(shellQuote)].join(" "), {
-      cwd,
-      timeoutMs: this.options.commandTimeoutMs,
-      execution: this.options.execution,
-    }).then((result) => {
-      if (result.exitCode !== 0) throw new Error(`hive loop start exited ${result.exitCode}: ${result.stderr.trim()}`);
-      return { ...result };
-    });
+    if (action.run === "loop") {
+      const loop = cwd && !Object.prototype.hasOwnProperty.call(action.loop, "cwd") ? { ...action.loop, cwd } : action.loop;
+      const flags = flagsFromRecord(loop);
+      return execShell(["hive", "loop", "start", ...flags.map(shellQuote)].join(" "), {
+        cwd,
+        timeoutMs: this.options.commandTimeoutMs,
+        execution: this.options.execution,
+      }).then((result) => {
+        if (result.exitCode !== 0) throw new Error(`hive loop start exited ${result.exitCode}: ${result.stderr.trim()}`);
+        return { ...result };
+      });
+    }
+    if (action.run === "spawn") {
+      const spawnCwd = action.cwd ?? cwd;
+      const flags = flagsFromRecord({
+        ...(action.name ? { name: action.name } : {}),
+        ...(action.colony ? { colony: action.colony } : {}),
+        ...(spawnCwd ? { cwd: spawnCwd } : {}),
+      });
+      const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
+      return execShell(["hive", "spawn", shellQuote(action.bee), ...flags.map(shellQuote)].join(" "), {
+        cwd: spawnCwd,
+        timeoutMs,
+        execution: this.options.execution,
+      }).then(async (result) => {
+        if (result.exitCode !== 0) throw new Error(`hive spawn exited ${result.exitCode}: ${result.stderr.trim()}`);
+        const handle = parseHiveHandle(result.stdout) ?? action.name;
+        if (!handle) throw new Error("hive spawn did not return a target handle");
+        if (action.message) {
+          const sent = await execShell(["hive", "send", shellQuote(handle), shellQuote(action.message)].join(" "), {
+            cwd: spawnCwd,
+            timeoutMs,
+            execution: this.options.execution,
+          });
+          if (sent.exitCode !== 0) throw new Error(`hive send exited ${sent.exitCode}: ${sent.stderr.trim()}`);
+          return { ...result, handle, sent };
+        }
+        return { ...result, handle };
+      });
+    }
+    if (action.run === "send") {
+      const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
+      return execShell(["hive", "send", shellQuote(action.target), shellQuote(action.message)].join(" "), {
+        cwd,
+        timeoutMs,
+        execution: this.options.execution,
+      }).then((result) => {
+        if (result.exitCode !== 0) throw new Error(`hive send exited ${result.exitCode}: ${result.stderr.trim()}`);
+        return { ...result };
+      });
+    }
+    if (action.run === "buz") {
+      const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
+      const command = [
+        "hive",
+        "buz",
+        "send",
+        shellQuote(action.target),
+        "--sender-human",
+        shellQuote(action.senderHuman ?? "pollinate"),
+        "--tier",
+        shellQuote(action.tier ?? "queue"),
+        ...(action.subject ? ["--subject", shellQuote(action.subject)] : []),
+        "-p",
+        shellQuote(action.message),
+      ].join(" ");
+      return execShell(command, { cwd, timeoutMs, execution: this.options.execution }).then((result) => {
+        if (result.exitCode !== 0) throw new Error(`hive buz send exited ${result.exitCode}: ${result.stderr.trim()}`);
+        return { ...result };
+      });
+    }
+    if (action.run === "kill") {
+      const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
+      return execShell(["hive", "kill", shellQuote(action.target)].join(" "), { cwd, timeoutMs, execution: this.options.execution }).then((result) => {
+        if (result.exitCode !== 0) throw new Error(`hive kill exited ${result.exitCode}: ${result.stderr.trim()}`);
+        return { ...result };
+      });
+    }
+    const neverAction: never = action;
+    throw new Error(`Unsupported honeybee action: ${JSON.stringify(neverAction)}`);
   }
 
   private executeHermes(action: Extract<Action, { kind: "hermes" }>, cwd?: string): Promise<ActionResult> {
@@ -203,6 +269,21 @@ export class ActionExecutor {
       return { ...result };
     });
   }
+}
+
+function flagsFromRecord(record: Record<string, JsonValue | undefined>): string[] {
+  return Object.entries(record).flatMap(([key, value]) => {
+    if (value === undefined || value === null) return [];
+    const flag = `--${key.replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)}`;
+    if (typeof value === "boolean") return value ? [flag] : [];
+    return [flag, String(value)];
+  });
+}
+
+function parseHiveHandle(stdout: string): string | undefined {
+  const line = stdout.split(/\r?\n/).map((item) => item.trim()).find(Boolean);
+  if (!line) return undefined;
+  return line.split(/\s+/)[0];
 }
 
 export function sourceKindForTrigger(trigger: Trigger, fallback: SourceKind = "manual"): SourceKind {

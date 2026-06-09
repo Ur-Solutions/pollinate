@@ -767,7 +767,9 @@ function describeAction(action: Action): string {
     case "hermes":
       return `${c.bold("hermes")} ${action.invoke}`;
     case "honeybee":
-      return action.run === "flow" ? `${c.bold("honeybee")} flow ${action.flow}` : `${c.bold("honeybee")} loop`;
+      if (action.run === "flow") return `${c.bold("honeybee")} flow ${action.flow}`;
+      if (action.run === "loop") return `${c.bold("honeybee")} loop`;
+      return `${c.bold("honeybee")} ${action.run}`;
     default:
       return (action as { kind: string }).kind;
   }
@@ -1014,7 +1016,50 @@ function actionFromFlags(args: ParsedArgs): Action {
       loop: keyValueJsonRecord(flagValues(args, "loop")),
     };
   }
-  throw new Error("Create requires --action <command|http|emit|hermes|honeybee-flow|honeybee-loop> or --action-json");
+  if (action === "honeybee-spawn" || (action === "honeybee" && stringFlag(args, "run") === "spawn")) {
+    return {
+      kind: "honeybee",
+      run: "spawn",
+      bee: requiredFlag(args, "bee", "Honeybee spawn actions require --bee <kind>"),
+      name: stringFlag(args, "name"),
+      colony: stringFlag(args, "colony"),
+      cwd: stringFlag(args, "cwd"),
+      message: stringFlag(args, "message") ?? stringFlag(args, "prompt"),
+      timeout: stringFlag(args, "timeout"),
+    };
+  }
+  if (action === "honeybee-send" || (action === "honeybee" && stringFlag(args, "run") === "send")) {
+    return {
+      kind: "honeybee",
+      run: "send",
+      target: requiredFlag(args, "target", "Honeybee send actions require --target <bee>"),
+      message: requiredFlag(args, "message", "Honeybee send actions require --message <text>"),
+      timeout: stringFlag(args, "timeout"),
+    };
+  }
+  if (action === "honeybee-buz" || (action === "honeybee" && stringFlag(args, "run") === "buz")) {
+    const tier = stringFlag(args, "tier");
+    if (tier && tier !== "interrupt" && tier !== "queue" && tier !== "passive") throw new Error("--tier must be interrupt, queue, or passive");
+    return {
+      kind: "honeybee",
+      run: "buz",
+      target: requiredFlag(args, "target", "Honeybee buz actions require --target <bee>"),
+      message: requiredFlag(args, "message", "Honeybee buz actions require --message <text>"),
+      tier: tier as "interrupt" | "queue" | "passive" | undefined,
+      subject: stringFlag(args, "subject"),
+      senderHuman: stringFlag(args, "sender-human"),
+      timeout: stringFlag(args, "timeout"),
+    };
+  }
+  if (action === "honeybee-kill" || (action === "honeybee" && stringFlag(args, "run") === "kill")) {
+    return {
+      kind: "honeybee",
+      run: "kill",
+      target: requiredFlag(args, "target", "Honeybee kill actions require --target <bee>"),
+      timeout: stringFlag(args, "timeout"),
+    };
+  }
+  throw new Error("Create requires --action <command|http|emit|hermes|honeybee-flow|honeybee-loop|honeybee-spawn|honeybee-send|honeybee-buz|honeybee-kill> or --action-json");
 }
 
 function contextFromFlags(args: ParsedArgs): ContextResolver | undefined {
