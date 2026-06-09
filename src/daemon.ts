@@ -24,11 +24,12 @@ export class PollinateDaemon {
     const executor = new ActionExecutor(this.store, {
       contextTimeoutMs: parseDuration(config.defaults.contextTimeout, 5_000),
       commandTimeoutMs: parseDuration(config.defaults.commandTimeout, 600_000),
+      execution: config.execution,
     });
     this.delivery = new DeliveryManager(this.store, executor);
     await this.delivery.init(triggers);
     this.schedule = new ScheduleEngine(this.store, this.delivery, triggers, config.defaults.tickMs);
-    this.poll = new PollEngine(this.store, this.delivery, triggers);
+    this.poll = new PollEngine(this.store, this.delivery, triggers, config.execution);
     this.webhook = new WebhookServer(this.store, this.delivery, triggers, config.webhook.bind, config.webhook.port);
     await this.schedule.start();
     await this.poll.start();

@@ -67,6 +67,25 @@ restart. The reload interval defaults to 1 second and can be changed in
 triggerReloadMs = 1000
 ```
 
+## Execution Profile
+
+Commands run by pollinate can use a configured shell and environment. This applies to
+poll command fetches, context command sources, and command/honeybee/hermes actions:
+
+```toml
+[execution]
+shell = "/bin/zsh"
+shellArgs = ["-lc"]
+inheritEnv = true
+
+[execution.env]
+PATH = "/Users/me/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+```
+
+Use a controlled `PATH` here instead of relying on an interactive terminal startup file.
+That keeps JSON-producing poll commands predictable while still giving jobs access to
+tools such as `gh`, `hive`, `node`, and `claude`.
+
 Install it as a user service on macOS or Linux:
 
 ```sh

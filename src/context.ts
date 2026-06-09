@@ -3,7 +3,7 @@ import { execShell } from "./process.js";
 import { selectJsonPath } from "./jsonpath.js";
 import { renderString } from "./templates.js";
 import { parseDuration, withTimeout } from "./time.js";
-import type { Activation, ContextResolver, Trigger } from "./types.js";
+import type { Activation, ContextResolver, ExecutionProfile, Trigger } from "./types.js";
 
 export type ResolvedContext = {
   context: Record<string, string>;
@@ -13,7 +13,7 @@ export type ResolvedContext = {
 export async function resolveContext(
   trigger: Trigger,
   activation: Activation,
-  options: { defaultTimeoutMs: number; cwd?: string },
+  options: { defaultTimeoutMs: number; cwd?: string; execution?: ExecutionProfile },
 ): Promise<ResolvedContext> {
   const context: Record<string, string> = {
     trigger_id: trigger.id,
@@ -28,7 +28,7 @@ export async function resolveContext(
   const defaultCwd = renderCwd(options.cwd, context);
   warnings.push(...defaultCwd.warnings);
   const sourceResults = await Promise.all(
-    (resolver.sources ?? []).map((source) => resolveSource(resolver, source, options.defaultTimeoutMs, defaultCwd.value, context)),
+    (resolver.sources ?? []).map((source) => resolveSource(resolver, source, options.defaultTimeoutMs, defaultCwd.value, context, options.execution)),
   );
   for (const result of sourceResults) {
     warnings.push(...result.warnings);
@@ -44,6 +44,7 @@ async function resolveSource(
   defaultTimeoutMs: number,
   defaultCwd: string | undefined,
   context: Record<string, string>,
+  execution: ExecutionProfile | undefined,
 ): Promise<{ ok: true; variable: string; value: string; warnings: string[] } | { ok: false; warning: string; warnings: string[] }> {
   const timeoutMs = parseDuration(source.timeout, defaultTimeoutMs);
   const cwd =
@@ -53,7 +54,7 @@ async function resolveSource(
         ? renderCwd(defaultCwd, context)
         : { value: undefined, warnings: [] };
   try {
-    const value = await withTimeout(resolveSourceValue(source, cwd.value), timeoutMs, `context source ${source.var}`);
+    const value = await withTimeout(resolveSourceValue(source, cwd.value, execution), timeoutMs, `context source ${source.var}`);
     return { ok: true, variable: source.var, value, warnings: cwd.warnings };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -61,9 +62,9 @@ async function resolveSource(
   }
 }
 
-async function resolveSourceValue(source: NonNullable<ContextResolver["sources"]>[number], cwd?: string): Promise<string> {
+async function resolveSourceValue(source: NonNullable<ContextResolver["sources"]>[number], cwd?: string, execution?: ExecutionProfile): Promise<string> {
   if (source.kind === "command") {
-    const result = await execShell(source.command, { cwd });
+    const result = await execShell(source.command, { cwd, execution });
     if (result.exitCode !== 0) throw new Error(`command exited ${result.exitCode}: ${result.stderr.trim()}`);
     return result.stdout.trimEnd();
   }
@@ -80,7 +81,7 @@ async function resolveSourceValue(source: NonNullable<ContextResolver["sources"]
     return (await readFile(source.path, "utf8")).trimEnd();
   }
   if (source.kind === "honeybee") {
-    const result = await execShell(`hive ${source.query}`, { cwd });
+    const result = await execShell(`hive ${source.query}`, { cwd, execution });
     if (result.exitCode !== 0) throw new Error(`hive exited ${result.exitCode}: ${result.stderr.trim()}`);
     return result.stdout.trimEnd();
   }

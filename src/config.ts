@@ -8,6 +8,7 @@ import type {
   Delivery,
   DeliveryMode,
   Filter,
+  ExecutionProfile,
   JsonValue,
   PollCursor,
   PollFetch,
@@ -24,6 +25,12 @@ type AnyRecord = Record<string, unknown>;
 export const DEFAULT_DAEMON_CONFIG: DaemonConfig = {
   webhook: { bind: "127.0.0.1", port: 3978 },
   defaults: { contextTimeout: "5s", commandTimeout: "10m", tickMs: 1_000, triggerReloadMs: 1_000 },
+  execution: {
+    shell: "/bin/sh",
+    shellArgs: ["-c"],
+    inheritEnv: true,
+    env: {},
+  },
 };
 
 export function parseTriggerToml(text: string, fallbackId?: string): Trigger {
@@ -41,6 +48,7 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
   const doc = parse(text) as AnyRecord;
   const webhook = asOptionalRecord(doc.webhook) ?? {};
   const defaults = asOptionalRecord(doc.defaults) ?? {};
+  const execution = asOptionalRecord(doc.execution) ?? {};
   return {
     webhook: {
       bind: stringOr(webhook.bind, DEFAULT_DAEMON_CONFIG.webhook.bind),
@@ -52,6 +60,7 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
       tickMs: numberOr(defaults.tickMs ?? defaults.tick_ms, DEFAULT_DAEMON_CONFIG.defaults.tickMs),
       triggerReloadMs: numberOr(defaults.triggerReloadMs ?? defaults.trigger_reload_ms, DEFAULT_DAEMON_CONFIG.defaults.triggerReloadMs),
     },
+    execution: normalizeExecution(execution),
   };
 }
 
@@ -88,6 +97,16 @@ function normalizeTrigger(raw: AnyRecord, fallbackId?: string): Trigger {
     action: normalizeAction(asRecord(raw.action, "trigger.action")),
     createdAt: stringOr(raw.createdAt ?? raw.created_at, now),
     updatedAt: stringOr(raw.updatedAt ?? raw.updated_at, now),
+  };
+}
+
+function normalizeExecution(raw: AnyRecord): ExecutionProfile {
+  const rawShellArgs = raw.shellArgs ?? raw.shell_args;
+  return {
+    shell: stringOr(raw.shell, DEFAULT_DAEMON_CONFIG.execution.shell),
+    shellArgs: Array.isArray(rawShellArgs) ? stringArray(rawShellArgs) : DEFAULT_DAEMON_CONFIG.execution.shellArgs,
+    inheritEnv: booleanOr(raw.inheritEnv ?? raw.inherit_env, DEFAULT_DAEMON_CONFIG.execution.inheritEnv),
+    env: stringRecord(asOptionalRecord(raw.env)) ?? {},
   };
 }
 

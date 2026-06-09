@@ -8,6 +8,7 @@ import { nowIso, parseDuration } from "./time.js";
 export type ActionExecutorOptions = {
   contextTimeoutMs: number;
   commandTimeoutMs: number;
+  execution?: ExecutionProfile;
 };
 
 type ActionResult = { timedOut?: boolean; [key: string]: unknown };
@@ -88,7 +89,7 @@ export class ActionExecutor {
   }
 
   private async buildContext(trigger: Trigger, activation: Activation, batch: JsonValue[], cwd?: string) {
-    const resolved = await resolveContext(trigger, activation, { defaultTimeoutMs: this.options.contextTimeoutMs, cwd });
+    const resolved = await resolveContext(trigger, activation, { defaultTimeoutMs: this.options.contextTimeoutMs, cwd, execution: this.options.execution });
     return {
       context: {
         ...resolved.context,
@@ -112,7 +113,7 @@ export class ActionExecutor {
   private async executeAction(action: Action, cwd?: string): Promise<ActionResult> {
     if (action.kind === "command") {
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-      const result = await execShell(action.command, { cwd: action.cwd ?? cwd, timeoutMs });
+      const result = await execShell(action.command, { cwd: action.cwd ?? cwd, timeoutMs, execution: this.options.execution });
       if (result.timedOut) return { ...result, timedOut: true };
       if (result.exitCode !== 0) throw new Error(`command exited ${result.exitCode}: ${result.stderr.trim()}`);
       return { ...result };
@@ -163,6 +164,7 @@ export class ActionExecutor {
       return execShell(["hive", "flow", "run", shellQuote(action.flow), ...args.map(shellQuote)].join(" "), {
         cwd,
         timeoutMs: this.options.commandTimeoutMs,
+        execution: this.options.execution,
       }).then((result) => {
         if (result.exitCode !== 0) throw new Error(`hive flow run exited ${result.exitCode}: ${result.stderr.trim()}`);
         return { ...result };
@@ -177,6 +179,7 @@ export class ActionExecutor {
     return execShell(["hive", "loop", "start", ...flags.map(shellQuote)].join(" "), {
       cwd,
       timeoutMs: this.options.commandTimeoutMs,
+      execution: this.options.execution,
     }).then((result) => {
       if (result.exitCode !== 0) throw new Error(`hive loop start exited ${result.exitCode}: ${result.stderr.trim()}`);
       return { ...result };
@@ -195,7 +198,7 @@ export class ActionExecutor {
       }, cwd);
     }
     const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-    return execShell(["hermes", shellQuote(action.invoke)].join(" "), { cwd, input: action.payload, timeoutMs }).then((result) => {
+    return execShell(["hermes", shellQuote(action.invoke)].join(" "), { cwd, input: action.payload, timeoutMs, execution: this.options.execution }).then((result) => {
       if (result.exitCode !== 0) throw new Error(`hermes exited ${result.exitCode}: ${result.stderr.trim()}`);
       return { ...result };
     });

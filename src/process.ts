@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import type { ExecutionProfile } from "./types.js";
 
 export type ExecResult = {
   exitCode: number | null;
@@ -8,13 +9,19 @@ export type ExecResult = {
   timedOut: boolean;
 };
 
-export function execShell(command: string, options: { cwd?: string; timeoutMs?: number; input?: string } = {}): Promise<ExecResult> {
+export function execShell(command: string, options: { cwd?: string; timeoutMs?: number; input?: string; execution?: ExecutionProfile } = {}): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, {
-      cwd: options.cwd,
-      shell: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const child = options.execution
+      ? spawn(options.execution.shell, [...options.execution.shellArgs, command], {
+          cwd: options.cwd,
+          env: executionEnv(options.execution),
+          stdio: ["pipe", "pipe", "pipe"],
+        })
+      : spawn(command, {
+          cwd: options.cwd,
+          shell: true,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -48,4 +55,11 @@ export function execShell(command: string, options: { cwd?: string; timeoutMs?: 
 
 export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function executionEnv(profile: ExecutionProfile): NodeJS.ProcessEnv {
+  return {
+    ...(profile.inheritEnv ? process.env : {}),
+    ...profile.env,
+  };
 }

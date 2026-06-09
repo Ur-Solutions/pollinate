@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import type { Activation, CursorState, JsonValue, PollSpec, Trigger } from "./types.js";
+import type { Activation, CursorState, ExecutionProfile, JsonValue, PollSpec, Trigger } from "./types.js";
 import { DeliveryManager } from "./delivery.js";
 import { PollinateStore } from "./store.js";
 import { execShell } from "./process.js";
@@ -16,6 +16,7 @@ export class PollEngine {
     private readonly store: PollinateStore,
     private readonly delivery: DeliveryManager,
     private triggers: Trigger[],
+    private readonly execution?: ExecutionProfile,
   ) {}
 
   async start(): Promise<void> {
@@ -39,7 +40,7 @@ export class PollEngine {
   async pollNow(trigger: Trigger): Promise<number> {
     if (trigger.source.kind !== "poll") throw new Error(`Trigger ${trigger.id} is not a poll trigger`);
     const spec = trigger.source.poll;
-    const fetched = await fetchPoll(spec, trigger.cwd);
+    const fetched = await fetchPoll(spec, trigger.cwd, this.execution);
     const delta = detectDelta(spec, trigger.id, fetched, this.cursors);
     if (delta.items.length > 0) {
       if (spec.emit === "per-item") {
@@ -103,13 +104,13 @@ export class PollEngine {
   }
 }
 
-export async function fetchPoll(spec: PollSpec, cwd?: string): Promise<string> {
+export async function fetchPoll(spec: PollSpec, cwd?: string, execution?: ExecutionProfile): Promise<string> {
   if (spec.fetch.kind === "file") return readFile(spec.fetch.path, "utf8").catch((error: unknown) => {
     if (typeof error === "object" && error !== null && "code" in error && (error as { code?: string }).code === "ENOENT") return "";
     throw error;
   });
   if (spec.fetch.kind === "command") {
-    const result = await execShell(spec.fetch.command, { cwd: spec.fetch.cwd ?? cwd });
+    const result = await execShell(spec.fetch.command, { cwd: spec.fetch.cwd ?? cwd, execution });
     if (result.exitCode !== 0) throw new Error(`poll command exited ${result.exitCode}: ${result.stderr.trim()}`);
     return result.stdout;
   }

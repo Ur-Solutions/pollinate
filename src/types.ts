@@ -147,6 +147,13 @@ export type DeliveryState = Record<
 
 export type CursorState = Record<string, JsonValue>;
 
+export type ExecutionProfile = {
+  shell: string;
+  shellArgs: string[];
+  inheritEnv: boolean;
+  env: Record<string, string>;
+};
+
 export type DaemonConfig = {
   webhook: {
     bind: string;
@@ -158,6 +165,7 @@ export type DaemonConfig = {
     tickMs: number;
     triggerReloadMs: number;
   };
+  execution: ExecutionProfile;
 };
 
 export type LedgerEvent = {

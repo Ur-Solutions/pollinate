@@ -535,6 +535,7 @@ async function newExecutor(store: PollinateStore): Promise<ActionExecutor> {
   return new ActionExecutor(store, {
     contextTimeoutMs: parseDuration(config.defaults.contextTimeout, 5_000),
     commandTimeoutMs: parseDuration(config.defaults.commandTimeout, 600_000),
+    execution: config.execution,
   });
 }
 
