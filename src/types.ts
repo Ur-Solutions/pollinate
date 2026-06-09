@@ -102,6 +102,8 @@ export type JobStatus =
 
 export type Job = {
   id: string;
+  idPrefix?: string;
+  uuid?: string;
   triggerId: string;
   source: SourceKind;
   status: JobStatus;

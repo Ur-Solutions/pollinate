@@ -17,6 +17,7 @@ import {
 import { idFromPath, parseDaemonConfigToml, parseTriggerToml, triggerToToml } from "./config.js";
 import type { CursorState, DaemonConfig, DeliveryState, Job, JobStatus, LedgerEvent, ScheduleState, Trigger } from "./types.js";
 import { nowIso } from "./time.js";
+import { allocateJobIdentity, matchesJobReference, type JobIdentity } from "./job-ids.js";
 
 export class PollinateStore {
   readonly root: string;
@@ -131,8 +132,15 @@ export class PollinateStore {
     await writeJson(this.jobPath(job.id), job);
   }
 
+  async allocateJobIdentity(trigger: Trigger): Promise<JobIdentity> {
+    await this.ensure();
+    return allocateJobIdentity({ root: this.root, trigger });
+  }
+
   async getJob(id: string): Promise<Job | null> {
-    return readJsonOr<Job | null>(this.jobPath(id), null);
+    const exact = await readJsonOr<Job | null>(this.jobPath(id), null);
+    if (exact) return exact;
+    return this.resolveJobReference(id);
   }
 
   async updateJob(id: string, patch: Partial<Job>): Promise<Job> {
@@ -171,8 +179,22 @@ export class PollinateStore {
       error: job.status === "running" ? "Cancellation requested after process start" : "Cancelled before start",
     };
     await this.saveJob(updated);
-    await this.appendLedger({ event: "pollinate.job.cancelled", job_id: id, trigger_id: job.triggerId });
+    await this.appendLedger({ event: "pollinate.job.cancelled", job_id: job.id, trigger_id: job.triggerId });
     return updated;
+  }
+
+  private async resolveJobReference(reference: string): Promise<Job | null> {
+    await this.ensure();
+    const entries = await readdir(jobsDir(this.root)).catch(() => []);
+    const matches: Job[] = [];
+    for (const entry of entries.filter((item) => item.endsWith(".json"))) {
+      const job = await readJsonOr<Job | null>(join(jobsDir(this.root), entry), null);
+      if (job && matchesJobReference(job, reference)) matches.push(job);
+    }
+    if (matches.length === 0) return null;
+    if (matches.length === 1) return matches[0];
+    const ids = matches.map((job) => job.id).sort().join(", ");
+    throw new Error(`Job reference "${reference}" is ambiguous: ${ids}`);
   }
 
   async appendLedger(event: LedgerEvent): Promise<void> {

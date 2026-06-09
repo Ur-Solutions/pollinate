@@ -152,7 +152,7 @@ export class DeliveryManager {
   }
 
   private async enqueue(trigger: Trigger, activation: Activation, batch: JsonValue[]): Promise<Job> {
-    const job = this.executor.createQueuedJob(trigger, activation, batch);
+    const job = await this.executor.createQueuedJob(trigger, activation, batch);
     await this.store.saveJob(job);
     await this.store.appendLedger({
       event: "pollinate.job.queued",

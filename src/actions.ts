@@ -1,5 +1,4 @@
-import { randomUUID } from "node:crypto";
-import type { Action, Activation, DryRunResult, Job, JsonValue, SourceKind, Trigger } from "./types.js";
+import type { Action, Activation, DryRunResult, ExecutionProfile, Job, JsonValue, SourceKind, Trigger } from "./types.js";
 import { PollinateStore } from "./store.js";
 import { resolveContext } from "./context.js";
 import { renderAction, renderString } from "./templates.js";
@@ -19,9 +18,12 @@ export class ActionExecutor {
     private readonly options: ActionExecutorOptions,
   ) {}
 
-  createQueuedJob(trigger: Trigger, activation: Activation, batch: JsonValue[]): Job {
+  async createQueuedJob(trigger: Trigger, activation: Activation, batch: JsonValue[]): Promise<Job> {
+    const identity = await this.store.allocateJobIdentity(trigger);
     return {
-      id: randomUUID(),
+      id: identity.id,
+      idPrefix: identity.idPrefix,
+      uuid: identity.uuid,
       triggerId: trigger.id,
       source: activation.source,
       status: "queued",

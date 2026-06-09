@@ -26,9 +26,17 @@ triggers/<id>.toml
 state/schedule-state.json
 state/delivery-state.json
 state/cursors.json
+state/job-id-index.json
 jobs/<jobId>.json
 ledger.jsonl
 ```
+
+Job IDs follow the Honeybee-style shape `<trigger-prefix><uuid-prefix>`, for example
+`HE.a3f`. The prefix is derived from the trigger ID, and the suffix is the shortest
+globally unused UUID prefix with at least three alphanumeric characters. The backing
+UUID is stored on the job and the index keeps suffixes from being reused over time.
+Jobs can be addressed by the visible ID, by the visible suffix, or by a longer prefix
+of the backing UUID.
 
 ## Basic Use
 

@@ -298,6 +298,11 @@ pollinate jobs [--status running|queued|completed|errored] [--trigger <id>] [--l
 pollinate job <jobId>
 pollinate job cancel <jobId>
 
+# Job IDs
+# Visible IDs are <trigger-prefix><uuid-prefix>, e.g. HE.a3f. The suffix is the
+# shortest globally unused backing-UUID prefix, never shorter than three chars,
+# and state/job-id-index.json prevents suffix reuse across historical jobs.
+
 # Webhooks (introspection; endpoints come from webhook-source triggers)
 pollinate hooks                          # list webhook routes + secrets-configured
 pollinate hook test <id> --payload '{...}'

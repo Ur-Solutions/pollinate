@@ -213,7 +213,7 @@ async function cmdTrigger(store: PollinateStore, args: ParsedArgs): Promise<void
     print(args, dryRun, renderDryRun(trigger, dryRun));
     return;
   }
-  const job = executor.createQueuedJob(trigger, activation, [payload]);
+  const job = await executor.createQueuedJob(trigger, activation, [payload]);
   await store.saveJob(job);
   await store.appendLedger({ event: "pollinate.job.queued", job_id: job.id, trigger_id: trigger.id, queue_position: 0, at: nowIso() });
   const completed = await runWithSpinner(args, `firing ${c.bold(trigger.id)}…`, () =>
@@ -354,7 +354,7 @@ async function cmdHook(store: PollinateStore, args: ParsedArgs): Promise<void> {
   const transformed = applyWebhookTransform(trigger.source.webhook, payload);
   const activation: Activation = { triggerId: trigger.id, source: "webhook", payload: transformed, receivedAt: nowIso() };
   const executor = await newExecutor(store);
-  const job = executor.createQueuedJob(trigger, activation, [transformed]);
+  const job = await executor.createQueuedJob(trigger, activation, [transformed]);
   await store.saveJob(job);
   await store.appendLedger({ event: "pollinate.webhook.received", trigger_id: trigger.id, path: trigger.source.webhook.path, source_ip: "hook-test", at: nowIso() });
   await store.appendLedger({ event: "pollinate.job.queued", job_id: job.id, trigger_id: trigger.id, queue_position: 0, at: nowIso() });

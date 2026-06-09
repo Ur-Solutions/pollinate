@@ -223,7 +223,7 @@ describe("context and actions", () => {
       expect(dry.action.kind).toBe("command");
       await expect(readFile(out, "utf8")).rejects.toThrow();
 
-      const job = executor.createQueuedJob(commandTrigger, activation, [{}]);
+      const job = await executor.createQueuedJob(commandTrigger, activation, [{}]);
       await store.saveJob(job);
       const completed = await executor.executeJob(job, commandTrigger, activation, [{}]);
       expect(completed.status).toBe("completed");
@@ -249,7 +249,7 @@ describe("context and actions", () => {
           action: { kind: "http", method: "POST", url: `http://127.0.0.1:${address.port}`, body: "{{event}}", timeout: "1s" },
         });
         const httpActivation = { triggerId: "http", source: "manual" as const, payload: { ok: true }, receivedAt: new Date().toISOString() };
-        const httpJob = executor.createQueuedJob(httpTrigger, httpActivation, [httpActivation.payload]);
+        const httpJob = await executor.createQueuedJob(httpTrigger, httpActivation, [httpActivation.payload]);
         await store.saveJob(httpJob);
         const httpCompleted = await executor.executeJob(httpJob, httpTrigger, httpActivation, [httpActivation.payload]);
         expect(httpCompleted.status).toBe("completed");
@@ -278,7 +278,7 @@ describe("context and actions", () => {
       });
       const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
       const activation = { triggerId: trig.id, source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
-      const job = executor.createQueuedJob(trig, activation, [{}]);
+      const job = await executor.createQueuedJob(trig, activation, [{}]);
       expect(job.cwd).toBe(repo);
       await store.saveJob(job);
 
@@ -320,7 +320,7 @@ describe("context and actions", () => {
       });
       const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
       const activation = { triggerId: trig.id, source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
-      const job = executor.createQueuedJob(trig, activation, [{}]);
+      const job = await executor.createQueuedJob(trig, activation, [{}]);
       await store.saveJob(job);
 
       const completed = await executor.executeJob(job, trig, activation, [{}]);
@@ -347,7 +347,7 @@ describe("context and actions", () => {
       });
       const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
       const activation = { triggerId: trig.id, source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
-      const job = executor.createQueuedJob(trig, activation, [{}]);
+      const job = await executor.createQueuedJob(trig, activation, [{}]);
       await store.saveJob(job);
 
       const editedTrigger = {
@@ -383,28 +383,28 @@ describe("context and actions", () => {
           context: { static: { topic: "auth" } },
         });
         const flowActivation = { triggerId: "flow", source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
-        const flowJob = executor.createQueuedJob(flow, flowActivation, [{}]);
+        const flowJob = await executor.createQueuedJob(flow, flowActivation, [{}]);
         await store.saveJob(flowJob);
         expect((await executor.executeJob(flowJob, flow, flowActivation, [{}])).status).toBe("completed");
         expect(await readFile(hiveLog, "utf8")).toContain("flow run review --arg topic=auth");
 
         const loop = trigger({ id: "loop", action: { kind: "honeybee", run: "loop", loop: { bee: "codex", cwd: root, max: 2 } } });
         const loopActivation = { triggerId: "loop", source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
-        const loopJob = executor.createQueuedJob(loop, loopActivation, [{}]);
+        const loopJob = await executor.createQueuedJob(loop, loopActivation, [{}]);
         await store.saveJob(loopJob);
         expect((await executor.executeJob(loopJob, loop, loopActivation, [{}])).status).toBe("completed");
         expect(await readFile(hiveLog, "utf8")).toContain(`loop start --bee codex --cwd ${root} --max 2`);
 
         const defaultLoop = trigger({ id: "loop-default", cwd: root, action: { kind: "honeybee", run: "loop", loop: { bee: "codex", max: 2 } } });
         const defaultLoopActivation = { triggerId: "loop-default", source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
-        const defaultLoopJob = executor.createQueuedJob(defaultLoop, defaultLoopActivation, [{}]);
+        const defaultLoopJob = await executor.createQueuedJob(defaultLoop, defaultLoopActivation, [{}]);
         await store.saveJob(defaultLoopJob);
         expect((await executor.executeJob(defaultLoopJob, defaultLoop, defaultLoopActivation, [{}])).status).toBe("completed");
         expect(await readFile(hiveLog, "utf8")).toContain(`loop start --bee codex --max 2 --cwd ${root}`);
 
         const hermes = trigger({ id: "hermes", action: { kind: "hermes", invoke: "respond", payload: '{"ok":true}' } });
         const hermesActivation = { triggerId: "hermes", source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
-        const hermesJob = executor.createQueuedJob(hermes, hermesActivation, [{}]);
+        const hermesJob = await executor.createQueuedJob(hermes, hermesActivation, [{}]);
         await store.saveJob(hermesJob);
         expect((await executor.executeJob(hermesJob, hermes, hermesActivation, [{}])).status).toBe("completed");
         expect(await readFile(hermesLog, "utf8")).toContain("respond");
