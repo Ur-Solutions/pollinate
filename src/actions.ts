@@ -1,0 +1,205 @@
+import { randomUUID } from "node:crypto";
+import type { Action, Activation, DryRunResult, Job, JsonValue, SourceKind, Trigger } from "./types.js";
+import { PollinateStore } from "./store.js";
+import { resolveContext } from "./context.js";
+import { renderAction, renderString } from "./templates.js";
+import { execShell, shellQuote } from "./process.js";
+import { nowIso, parseDuration } from "./time.js";
+
+export type ActionExecutorOptions = {
+  contextTimeoutMs: number;
+  commandTimeoutMs: number;
+};
+
+type ActionResult = { timedOut?: boolean; [key: string]: unknown };
+
+export class ActionExecutor {
+  constructor(
+    private readonly store: PollinateStore,
+    private readonly options: ActionExecutorOptions,
+  ) {}
+
+  createQueuedJob(trigger: Trigger, activation: Activation, batch: JsonValue[]): Job {
+    return {
+      id: randomUUID(),
+      triggerId: trigger.id,
+      source: activation.source,
+      status: "queued",
+      cwd: trigger.cwd,
+      context: {},
+      action: trigger.action,
+      queuedAt: nowIso(),
+      batch,
+    };
+  }
+
+  async dryRun(trigger: Trigger, activation: Activation, batch: JsonValue[] = [activation.payload]): Promise<DryRunResult> {
+    const resolved = await this.buildContext(trigger, activation, batch, trigger.cwd);
+    const rendered = this.renderJobInputs(trigger.action, trigger.cwd, resolved.context);
+    return {
+      triggerId: trigger.id,
+      cwd: rendered.cwd,
+      context: resolved.context,
+      action: rendered.action,
+      warnings: [...resolved.warnings, ...rendered.warnings],
+    };
+  }
+
+  async executeJob(job: Job, trigger: Trigger, activation: Activation, batch: JsonValue[]): Promise<Job> {
+    const cancellation = await this.store.getJob(job.id);
+    if (cancellation?.status === "cancelled") return cancellation;
+    await this.store.updateJob(job.id, { status: "resolving-context" });
+    const jobCwd = job.cwd ?? trigger.cwd;
+    const resolved = await this.buildContext(trigger, activation, batch, jobCwd);
+    const rendered = this.renderJobInputs(job.action, jobCwd, resolved.context);
+    const warnings = resolved.warnings.concat(rendered.warnings);
+    const running = await this.store.updateJob(job.id, {
+      status: "running",
+      cwd: rendered.cwd,
+      context: resolved.context,
+      action: rendered.action,
+      startedAt: nowIso(),
+    });
+    await this.store.appendLedger({ event: "pollinate.job.started", job_id: job.id, trigger_id: trigger.id, action_kind: rendered.action.kind, cwd: rendered.cwd });
+    try {
+      const result = await this.executeAction(rendered.action, rendered.cwd);
+      const completed = await this.store.updateJob(job.id, {
+        status: result.timedOut ? "timed-out" : "completed",
+        result,
+        completedAt: nowIso(),
+        error: warnings.join("\n") || undefined,
+      });
+      await this.store.appendLedger({
+        event: result.timedOut ? "pollinate.job.errored" : "pollinate.job.completed",
+        job_id: job.id,
+        trigger_id: trigger.id,
+        duration_ms: running.startedAt ? Date.now() - new Date(running.startedAt).getTime() : undefined,
+        warnings,
+      });
+      return completed;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const errored = await this.store.updateJob(job.id, { status: "errored", error: message, completedAt: nowIso() });
+      await this.store.appendLedger({ event: "pollinate.job.errored", job_id: job.id, trigger_id: trigger.id, error: message });
+      return errored;
+    }
+  }
+
+  private async buildContext(trigger: Trigger, activation: Activation, batch: JsonValue[], cwd?: string) {
+    const resolved = await resolveContext(trigger, activation, { defaultTimeoutMs: this.options.contextTimeoutMs, cwd });
+    return {
+      context: {
+        ...resolved.context,
+        batch: JSON.stringify(batch),
+        batch_count: String(batch.length),
+      },
+      warnings: resolved.warnings,
+    };
+  }
+
+  private renderJobInputs(action: Action, cwd: string | undefined, context: Record<string, string>): { action: Action; cwd?: string; warnings: string[] } {
+    const renderedAction = renderAction(action, context);
+    const renderedCwd = cwd ? renderString(cwd, context) : { value: undefined, warnings: [] };
+    return {
+      action: renderedAction.value,
+      cwd: renderedCwd.value,
+      warnings: [...renderedAction.warnings, ...renderedCwd.warnings],
+    };
+  }
+
+  private async executeAction(action: Action, cwd?: string): Promise<ActionResult> {
+    if (action.kind === "command") {
+      const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
+      const result = await execShell(action.command, { cwd: action.cwd ?? cwd, timeoutMs });
+      if (result.timedOut) return { ...result, timedOut: true };
+      if (result.exitCode !== 0) throw new Error(`command exited ${result.exitCode}: ${result.stderr.trim()}`);
+      return { ...result };
+    }
+    if (action.kind === "http") {
+      const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(action.url, {
+          method: action.method,
+          headers: action.headers,
+          body: action.body,
+          signal: controller.signal,
+        });
+        const body = await response.text();
+        if (!response.ok) throw new Error(`HTTP ${response.status}: ${body.slice(0, 500)}`);
+        return { status: response.status, body };
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    if (action.kind === "honeybee") {
+      return this.executeHoneybee(action, cwd);
+    }
+    if (action.kind === "hermes") {
+      return this.executeHermes(action, cwd);
+    }
+    if (action.kind === "emit") {
+      let payload: JsonValue | string | undefined = action.payload;
+      if (action.payload) {
+        try {
+          payload = JSON.parse(action.payload) as JsonValue;
+        } catch {
+          payload = action.payload;
+        }
+      }
+      await this.store.appendLedger({ event: "pollinate.emit", subject: action.subject, payload });
+      return { subject: action.subject, payload };
+    }
+    const neverAction: never = action;
+    throw new Error(`Unsupported action: ${JSON.stringify(neverAction)}`);
+  }
+
+  private executeHoneybee(action: Extract<Action, { kind: "honeybee" }>, cwd?: string): Promise<ActionResult> {
+    if (action.run === "flow") {
+      const args = Object.entries(action.args ?? {}).flatMap(([key, value]) => ["--arg", `${key}=${value}`]);
+      return execShell(["hive", "flow", "run", shellQuote(action.flow), ...args.map(shellQuote)].join(" "), {
+        cwd,
+        timeoutMs: this.options.commandTimeoutMs,
+      }).then((result) => {
+        if (result.exitCode !== 0) throw new Error(`hive flow run exited ${result.exitCode}: ${result.stderr.trim()}`);
+        return { ...result };
+      });
+    }
+    const loop = cwd && !Object.prototype.hasOwnProperty.call(action.loop, "cwd") ? { ...action.loop, cwd } : action.loop;
+    const flags = Object.entries(loop).flatMap(([key, value]) => {
+      const flag = `--${key.replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)}`;
+      if (typeof value === "boolean") return value ? [flag] : [];
+      return [flag, String(value)];
+    });
+    return execShell(["hive", "loop", "start", ...flags.map(shellQuote)].join(" "), {
+      cwd,
+      timeoutMs: this.options.commandTimeoutMs,
+    }).then((result) => {
+      if (result.exitCode !== 0) throw new Error(`hive loop start exited ${result.exitCode}: ${result.stderr.trim()}`);
+      return { ...result };
+    });
+  }
+
+  private executeHermes(action: Extract<Action, { kind: "hermes" }>, cwd?: string): Promise<ActionResult> {
+    if (/^https?:\/\//.test(action.invoke)) {
+      return this.executeAction({
+        kind: "http",
+        method: "POST",
+        url: action.invoke,
+        headers: { "content-type": "application/json" },
+        body: action.payload ?? "{}",
+        timeout: action.timeout,
+      }, cwd);
+    }
+    const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
+    return execShell(["hermes", shellQuote(action.invoke)].join(" "), { cwd, input: action.payload, timeoutMs }).then((result) => {
+      if (result.exitCode !== 0) throw new Error(`hermes exited ${result.exitCode}: ${result.stderr.trim()}`);
+      return { ...result };
+    });
+  }
+}
+
+export function sourceKindForTrigger(trigger: Trigger, fallback: SourceKind = "manual"): SourceKind {
+  return trigger.source.kind === "manual" ? fallback : trigger.source.kind;
+}
