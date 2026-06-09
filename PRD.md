@@ -109,6 +109,7 @@ type Trigger = {
   id: string;                 // unique, used in URLs/CLI
   name: string;
   description?: string;
+  cwd?: string;                // default working directory for command-backed work
   tags: string[];
   enabled: boolean;
   source: Source;             // what activates it
@@ -119,6 +120,11 @@ type Trigger = {
   createdAt: string; updatedAt: string;
 };
 ```
+
+`cwd` is a trigger-level default. Command poll fetches, command context sources,
+command actions, and Honeybee/Hermes CLI actions inherit it unless they define a
+more specific `cwd`. Jobs snapshot the trigger `cwd` when queued so later trigger
+edits do not move already queued work.
 
 ### 7.2 Source — what activates the trigger
 
@@ -238,6 +244,7 @@ type Job = {
   triggerId: string;
   source: "schedule" | "poll" | "webhook" | "manual";
   status: "queued" | "resolving-context" | "running" | "completed" | "errored" | "timed-out";
+  cwd?: string;                              // snapshotted from trigger at queue time
   context: Record<string,string>;          // resolved vars injected
   action: Action;                           // rendered
   result?: unknown;                         // exit code / handle / response
