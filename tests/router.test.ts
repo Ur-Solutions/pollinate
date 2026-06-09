@@ -33,6 +33,24 @@ describe("github-pr router plugin", () => {
     expect(opened[0]?.kind).toBe("github.pull_request.opened");
     expect(comment[0]?.kind).toBe("github.issue_comment.created");
   });
+
+  test("ignores comments marked as pollinate router output", () => {
+    const events = githubPrRouterPlugin.normalize({
+      headers: { "x-github-event": "issue_comment" },
+      body: {
+        action: "created",
+        repository: { full_name: "trmd/pollinate" },
+        sender: { login: "alice" },
+        issue: { number: 123, title: "Add router", pull_request: { html_url: "https://github.com/trmd/pollinate/pull/123" } },
+        comment: {
+          body: "<!-- pollinate-router -->\n\nReview complete.",
+          html_url: "https://github.com/trmd/pollinate/pull/123#issuecomment-2",
+        },
+      },
+    });
+
+    expect(events).toEqual([]);
+  });
 });
 
 describe("router bindings", () => {
@@ -69,7 +87,7 @@ cat >/dev/null
           action: undefined,
           router: {
             plugin: "github-pr",
-            openOn: ["github.pull_request.opened"],
+            openOn: ["github.pull_request.opened", "github.pull_request.reopened"],
             closeOn: ["github.pull_request.merged"],
             onOpen: {
               kind: "honeybee",
@@ -147,9 +165,42 @@ cat >/dev/null
 
           binding = await store.getRouterBinding("github-pr", "github:pull_request:trmd/pollinate#123");
           expect(binding?.status).toBe("closed");
+
+          await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-github-event": "pull_request" },
+            body: JSON.stringify({
+              action: "reopened",
+              repository: { full_name: "trmd/pollinate" },
+              sender: { login: "alice" },
+              pull_request: { number: 123, html_url: "https://github.com/trmd/pollinate/pull/123", title: "Add router", state: "open" },
+            }),
+          });
+          await waitForTerminalJobs(store, 4);
+
+          binding = await store.getRouterBinding("github-pr", "github:pull_request:trmd/pollinate#123");
+          expect(binding).toMatchObject({ status: "active", target: { handle: "pr-trmd-pollinate-123" } });
+
+          await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-github-event": "pull_request" },
+            body: JSON.stringify({
+              action: "closed",
+              repository: { full_name: "trmd/pollinate" },
+              sender: { login: "alice" },
+              pull_request: { number: 123, html_url: "https://github.com/trmd/pollinate/pull/123", title: "Add router", state: "closed", merged: true },
+            }),
+          });
+          await waitForTerminalJobs(store, 5);
+
+          binding = await store.getRouterBinding("github-pr", "github:pull_request:trmd/pollinate#123");
+          expect(binding?.status).toBe("closed");
+
           const log = await readFile(hiveLog, "utf8");
           expect(log).toContain("spawn codex --name pr-trmd-pollinate-123");
           expect(log).toContain("--no-yolo -- --allowedTools Read");
+          expect(log.match(/spawn codex/g)).toHaveLength(2);
+          expect(log.match(/kill pr-trmd-pollinate-123/g)).toHaveLength(2);
           expect(log).toContain("send pr-trmd-pollinate-123 Review trmd/pollinate#123: Add router");
           expect(log).toContain("buz send pr-trmd-pollinate-123 --sender-human pollinate --tier queue --subject github.issue_comment.created");
           expect(log).toContain("kill pr-trmd-pollinate-123");

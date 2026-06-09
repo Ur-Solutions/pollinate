@@ -226,6 +226,8 @@ Router triggers correlate many incoming events to one long-lived target. The
 first in-tree router plugin is `github-pr`: it normalizes GitHub PR webhooks into
 a stable subject key such as `github:pull_request:owner/repo#123`. Pollinate owns
 the binding state and target lifecycle; router plugins only normalize payloads.
+See [docs/pr-router.md](docs/pr-router.md) for the full GitHub PR review setup,
+binding lifecycle, and verification commands.
 
 ```toml
 [trigger]
@@ -245,8 +247,8 @@ maxConcurrent = 4
 
 [trigger.router]
 plugin = "github-pr"
-openOn = ["github.pull_request.opened", "github.pull_request.ready_for_review"]
-closeOn = ["github.pull_request.merged"]
+openOn = ["github.pull_request.opened", "github.pull_request.reopened", "github.pull_request.ready_for_review"]
+closeOn = ["github.pull_request.closed", "github.pull_request.merged"]
 
 [trigger.router.onOpen]
 kind = "honeybee"
@@ -254,16 +256,14 @@ run = "spawn"
 bee = "codex"
 name = "pr-{{repo_slug}}-{{pr_number}}"
 cwd = "/Users/me/src/{{repo_name}}"
-args = ["--allowedTools", "Bash(gh pr view *),Bash(gh pr diff *),Read,Grep,Glob,LS"]
-message = "Review PR {{repo}}#{{pr_number}}: {{pr_title}}"
+args = ["--allowedTools", "Bash(gh pr view *),Bash(gh pr diff *),Bash(gh pr comment *),Read,Grep,Glob,LS"]
+message = "Review PR {{repo}}#{{pr_number}}: {{pr_title}}. If you post a PR comment, include <!-- pollinate-router --> at the top."
 
 [trigger.router.onActivity]
 kind = "honeybee"
-run = "buz"
+run = "send"
 target = "{{binding.target}}"
-tier = "queue"
-subject = "{{event_kind}}"
-message = "{{activity_markdown}}"
+message = "New PR activity for {{repo}}#{{pr_number}}:\n\n{{activity_markdown}}\n\nIf you post a PR comment, include <!-- pollinate-router --> at the top."
 
 [trigger.router.onClose]
 kind = "honeybee"
@@ -277,6 +277,15 @@ Inspect runtime subject-to-target bindings with:
 pollinate bindings
 pollinate bindings get <binding-id>
 ```
+
+Use `honeybee` `run = "send"` for activity that must wake the target bee and
+be handled as a normal prompt. `run = "buz"` is useful for addressed messaging,
+but queue/passive tiers depend on Hive buz delivery policy and daemon behavior;
+they are not a substitute for direct prompt delivery when the router is expected
+to make the bee react immediately. GitHub comments containing
+`<!-- pollinate-router -->` are ignored by the `github-pr` router plugin; include
+that hidden marker in PR comments posted by router-controlled bees to avoid
+routing their own output back into the same target.
 
 ## CLI-Only Creation
 

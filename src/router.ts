@@ -51,7 +51,7 @@ async function handleRouterEvent(
   return options.store.withRouterBindingLock(options.trigger.id, event.subjectKey, async () => {
     const current = await options.store.getRouterBinding(options.trigger.id, event.subjectKey);
     if (router.openOn.includes(event.kind)) {
-      if (current?.target) {
+      if (current?.target && current.status !== "closed" && current.status !== "errored") {
         await options.store.appendLedger({
           event: "pollinate.router.already_bound",
           trigger_id: options.trigger.id,
@@ -88,15 +88,17 @@ async function createBinding(
   existing: RouterBinding | null,
 ): Promise<RouterEventResult> {
   const now = nowIso();
-  const pending: RouterBinding = existing ?? {
-    id: bindingId(options.trigger.id, event.subjectKey),
-    triggerId: options.trigger.id,
-    router: router.plugin,
-    subjectKey: event.subjectKey,
-    status: "pending",
-    createdAt: now,
-    updatedAt: now,
-  };
+  const pending: RouterBinding = existing
+    ? { ...existing, status: "pending", target: undefined, error: undefined, updatedAt: now }
+    : {
+        id: bindingId(options.trigger.id, event.subjectKey),
+        triggerId: options.trigger.id,
+        router: router.plugin,
+        subjectKey: event.subjectKey,
+        status: "pending",
+        createdAt: now,
+        updatedAt: now,
+      };
   await options.store.saveRouterBinding({ ...pending, status: "pending", updatedAt: now, lastEventKind: event.kind });
   await options.store.appendLedger({
     event: "pollinate.router.binding_pending",

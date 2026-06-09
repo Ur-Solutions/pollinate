@@ -48,12 +48,14 @@ function normalizeIssueComment(body: AnyRecord): CanonicalRouterEvent[] {
   const number = numberValue(issue.number);
   if (number === undefined) return [];
   const action = stringValue(body.action, "unknown");
+  const comment = asRecord(body.comment);
+  if (markedPollinateRouterComment(stringValue(comment?.body))) return [];
   return [
     eventForNumber(body, repo, number, `github.issue_comment.${action}`, clean({
       pr_url: stringValue(asRecord(issue.pull_request)?.html_url),
       pr_title: stringValue(issue.title),
-      activity_url: stringValue(asRecord(body.comment)?.html_url),
-      comment_body: stringValue(asRecord(body.comment)?.body),
+      activity_url: stringValue(comment?.html_url),
+      comment_body: stringValue(comment?.body),
     })),
   ];
 }
@@ -79,6 +81,7 @@ function normalizePullRequestReviewComment(body: AnyRecord): CanonicalRouterEven
   if (!repo || !pr) return [];
   const action = stringValue(body.action, "unknown");
   const comment = asRecord(body.comment);
+  if (markedPollinateRouterComment(stringValue(comment?.body))) return [];
   return [
     eventForPr(body, repo, pr, `github.pull_request_review_comment.${action}`, clean({
       activity_url: stringValue(comment?.html_url),
@@ -154,6 +157,10 @@ function activityMarkdown(input: { repo: string; prNumber: number; kind: string;
   const url = stringValue(input.extra.activity_url) ?? stringValue(input.extra.pr_url);
   if (url) lines.push("", url);
   return lines.join("\n");
+}
+
+function markedPollinateRouterComment(body: string | undefined): boolean {
+  return body?.includes("<!-- pollinate-router -->") ?? false;
 }
 
 function repoFullName(value: unknown): string | undefined {
