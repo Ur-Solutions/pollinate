@@ -23,6 +23,7 @@ export class DeliveryManager {
   async init(triggers: Trigger[]): Promise<void> {
     this.triggers = new Map(triggers.map((trigger) => [trigger.id, trigger]));
     this.persisted = await this.store.readDeliveryState();
+    if (this.pruneOrphanedState()) await this.persist();
     if (!this.restored) {
       this.restored = true;
       await this.restore();
@@ -69,6 +70,22 @@ export class DeliveryManager {
       }
       void this.drain(trigger);
     }
+  }
+
+  private pruneOrphanedState(): boolean {
+    let changed = false;
+    for (const triggerId of Object.keys(this.persisted)) {
+      if (this.triggers.has(triggerId)) continue;
+      delete this.persisted[triggerId];
+      changed = true;
+    }
+    for (const [triggerId, state] of this.runtime.entries()) {
+      if (this.triggers.has(triggerId)) continue;
+      if (state.timer) clearTimeout(state.timer);
+      this.runtime.delete(triggerId);
+      changed = true;
+    }
+    return changed;
   }
 
   private async handleThrottled(trigger: Trigger, activation: Activation): Promise<Job | null> {

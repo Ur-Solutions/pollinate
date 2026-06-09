@@ -42,6 +42,13 @@ export class PollEngine {
     const spec = trigger.source.poll;
     const fetched = await fetchPoll(spec, trigger.cwd, this.execution);
     const delta = detectDelta(spec, trigger.id, fetched, this.cursors);
+    await this.store.appendLedger({
+      event: "pollinate.poll.checked",
+      trigger_id: trigger.id,
+      item_count: delta.itemCount,
+      new_count: delta.items.length,
+      at: nowIso(),
+    });
     if (delta.items.length > 0) {
       if (spec.emit === "per-item") {
         for (const item of delta.items) {
@@ -125,16 +132,17 @@ export function detectDelta(
   triggerId: string,
   fetched: string,
   cursors: CursorState,
-): { items: JsonValue[]; cursors: CursorState } {
+): { items: JsonValue[]; cursors: CursorState; itemCount: number } {
   const next = { ...cursors };
   const key = triggerId;
   if (spec.cursor.strategy === "append-offset") {
     const previous = typeof cursors[key] === "number" ? cursors[key] : 0;
     const current = fetched.length;
+    const itemCount = parseLines(fetched).length;
     next[key] = current;
-    if (current <= previous) return { items: [], cursors: next };
+    if (current <= previous) return { items: [], cursors: next, itemCount };
     const delta = fetched.slice(previous);
-    return { items: parseLines(delta), cursors: next };
+    return { items: parseLines(delta), cursors: next, itemCount };
   }
   if (spec.cursor.strategy === "hash") {
     const previous = new Set(Array.isArray(cursors[key]) ? (cursors[key] as JsonValue[]).map(String) : []);
@@ -147,7 +155,7 @@ export function detectDelta(
       if (!previous.has(hash)) newItems.push(item);
     }
     next[key] = hashes;
-    return { items: newItems, cursors: next };
+    return { items: newItems, cursors: next, itemCount: items.length };
   }
   const json = JSON.parse(fetched || "null");
   const selected = selectJsonPathArray(spec.cursor.jsonpath, json);
@@ -157,6 +165,7 @@ export function detectDelta(
   return {
     items: selected.filter((item) => !previous.has(String(item))).map(toJsonValue),
     cursors: next,
+    itemCount: selected.length,
   };
 }
 

@@ -69,6 +69,42 @@ describe("poll cursors", () => {
       expect(fetched).toBe('{"id":1}\n');
     });
   });
+
+  test("successful no-op polls are logged as checked events", async () => {
+    await withTempStore(async (store, root) => {
+      const sourceFile = join(root, "events.jsonl");
+      const contents = '{"id":1}\n{"id":2}\n';
+      await writeFile(sourceFile, contents);
+      await store.writeCursorState({ noop: contents.length });
+      const trig = trigger({
+        id: "noop",
+        source: {
+          kind: "poll",
+          poll: {
+            interval: "1m",
+            emit: "per-item",
+            fetch: { kind: "file", path: sourceFile },
+            cursor: { strategy: "append-offset" },
+          },
+        },
+      });
+      const delivery = new DeliveryManager(store, new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 }));
+      await delivery.init([trig]);
+      const poll = new PollEngine(store, delivery, [trig]);
+      await poll.start();
+      try {
+        const newCount = await poll.pollNow(trig);
+        expect(newCount).toBe(0);
+        const checked = (await store.readLedger())
+          .map((line) => JSON.parse(line) as { event: string; trigger_id?: string; item_count?: number; new_count?: number })
+          .find((event) => event.event === "pollinate.poll.checked");
+        expect(checked).toMatchObject({ trigger_id: "noop", item_count: 2, new_count: 0 });
+      } finally {
+        await poll.stop();
+        await delivery.shutdown();
+      }
+    });
+  });
 });
 
 describe("webhooks", () => {

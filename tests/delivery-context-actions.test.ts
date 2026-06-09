@@ -34,6 +34,16 @@ describe("delivery manager", () => {
     });
   });
 
+  test("init prunes delivery state for removed triggers", async () => {
+    await withTempStore(async (store) => {
+      await store.writeDeliveryState({ orphaned: { queue: [] } });
+      const delivery = new DeliveryManager(store, new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 }));
+      await delivery.init([trigger({ id: "active" })]);
+      expect(await store.readDeliveryState()).toEqual({});
+      await delivery.shutdown();
+    });
+  });
+
   test("batched, debounced, and throttled collect payloads into batch vars", async () => {
     await withTempStore(async (store) => {
       const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });

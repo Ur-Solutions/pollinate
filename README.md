@@ -256,3 +256,14 @@ pollinate create fanout \
   --delivery-json '{"mode":{"strategy":"debounced","quietPeriod":"30s"},"maxConcurrent":1}' \
   --action-json '{"kind":"emit","subject":"fanout.received","payload":"{{event}}"}'
 ```
+
+## Poll Visibility
+
+Every successful poll writes a `pollinate.poll.checked` ledger event:
+
+```json
+{"event":"pollinate.poll.checked","trigger_id":"example","item_count":2,"new_count":0}
+```
+
+When `new_count` is greater than zero, pollinate also emits `pollinate.poll.detected`
+and dispatches jobs according to the trigger delivery policy.
