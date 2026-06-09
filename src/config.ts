@@ -14,6 +14,7 @@ import type {
   PollCursor,
   PollFetch,
   PollSpec,
+  RouterConfig,
   ScheduleTiming,
   Source,
   Trigger,
@@ -99,6 +100,9 @@ function normalizeTrigger(raw: AnyRecord, fallbackId?: string): Trigger {
   const id = stringOr(raw.id, fallbackId ?? slugify(name));
   const source = normalizeSource(asRecord(raw.source, "trigger.source"));
   const delivery = normalizeDelivery(asRecord(raw.delivery, "trigger.delivery"));
+  const router = normalizeRouter(asOptionalRecord(raw.router));
+  const actionRaw = asOptionalRecord(raw.action);
+  if (!actionRaw && !router) throw new Error("Trigger requires either [trigger.action] or [trigger.router]");
   return {
     id,
     name,
@@ -111,7 +115,8 @@ function normalizeTrigger(raw: AnyRecord, fallbackId?: string): Trigger {
     delivery,
     context: normalizeContext(asOptionalRecord(raw.context)),
     lifecycle: normalizeLifecycle(asOptionalRecord(raw.lifecycle)),
-    action: normalizeAction(asRecord(raw.action, "trigger.action")),
+    router,
+    action: actionRaw ? normalizeAction(actionRaw) : undefined,
     createdAt: stringOr(raw.createdAt ?? raw.created_at, now),
     updatedAt: stringOr(raw.updatedAt ?? raw.updated_at, now),
   };
@@ -288,6 +293,25 @@ function normalizeContextSource(raw: AnyRecord): ContextSource {
   throw new Error(`Unsupported context source kind: ${kind || "(missing)"}`);
 }
 
+function normalizeRouter(raw: AnyRecord | undefined): RouterConfig | undefined {
+  if (!raw) return undefined;
+  const plugin = requiredString(raw.plugin, "trigger.router.plugin");
+  const openOn = eventList(raw.openOn ?? raw.open_on, "trigger.router.openOn");
+  const closeOn = eventList(raw.closeOn ?? raw.close_on, "trigger.router.closeOn");
+  const onOpen = normalizeAction(asRecord(raw.onOpen ?? raw.on_open, "trigger.router.onOpen"));
+  const onActivity = normalizeAction(asRecord(raw.onActivity ?? raw.on_activity, "trigger.router.onActivity"));
+  const onCloseRaw = asOptionalRecord(raw.onClose ?? raw.on_close);
+  return {
+    plugin,
+    openOn,
+    closeOn,
+    idleTtl: optionalString(raw.idleTtl ?? raw.idle_ttl),
+    onOpen,
+    onActivity,
+    onClose: onCloseRaw ? normalizeAction(onCloseRaw) : undefined,
+  };
+}
+
 function normalizeAction(raw: AnyRecord): Action {
   const kind = stringOr(raw.kind, "");
   if (kind === "command") {
@@ -323,7 +347,11 @@ function normalizeAction(raw: AnyRecord): Action {
         bee: requiredString(raw.bee, "trigger.action.bee"),
         name: optionalString(raw.name),
         colony: optionalString(raw.colony),
+        home: optionalString(raw.home),
         cwd: optionalString(raw.cwd),
+        yolo: optionalBoolean(raw.yolo),
+        acceptTrust: optionalBoolean(raw.acceptTrust ?? raw.accept_trust),
+        args: stringArray(raw.args ?? raw.beeArgs ?? raw.bee_args),
         message: optionalString(raw.message ?? raw.prompt),
         timeout: optionalString(raw.timeout),
       };
@@ -396,6 +424,7 @@ function stripRuntimeDates(trigger: Trigger): AnyRecord {
     delivery: deliveryToToml(trigger.delivery),
     context: trigger.context,
     lifecycle: trigger.lifecycle,
+    router: trigger.router,
     action: trigger.action,
     createdAt: trigger.createdAt,
     updatedAt: trigger.updatedAt,
@@ -442,6 +471,11 @@ function booleanOr(value: unknown, fallback: boolean): boolean {
   if (typeof value === "boolean") return value;
   if (typeof value === "string") return value === "true";
   return fallback;
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  return booleanOr(value, false);
 }
 
 function numberOr(value: unknown, fallback: number): number {

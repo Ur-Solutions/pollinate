@@ -220,6 +220,64 @@ Supported delivery modes are `immediate`, `throttled`, `batched`, and `debounced
 command fetches, context command sources, command actions, Honeybee/Hermes CLI
 actions, and queued jobs inherit it unless a lower-level `cwd` is set.
 
+## Router Triggers
+
+Router triggers correlate many incoming events to one long-lived target. The
+first in-tree router plugin is `github-pr`: it normalizes GitHub PR webhooks into
+a stable subject key such as `github:pull_request:owner/repo#123`. Pollinate owns
+the binding state and target lifecycle; router plugins only normalize payloads.
+
+```toml
+[trigger]
+id = "github-pr-events"
+name = "GitHub PR events"
+enabled = true
+
+[trigger.source]
+kind = "webhook"
+[trigger.source.webhook]
+path = "github/pr-events"
+secret = "env:GITHUB_WEBHOOK_SECRET"
+
+[trigger.delivery]
+mode = "immediate"
+maxConcurrent = 4
+
+[trigger.router]
+plugin = "github-pr"
+openOn = ["github.pull_request.opened", "github.pull_request.ready_for_review"]
+closeOn = ["github.pull_request.merged"]
+
+[trigger.router.onOpen]
+kind = "honeybee"
+run = "spawn"
+bee = "codex"
+name = "pr-{{repo_slug}}-{{pr_number}}"
+cwd = "/Users/me/src/{{repo_name}}"
+args = ["--allowedTools", "Bash(gh pr view *),Bash(gh pr diff *),Read,Grep,Glob,LS"]
+message = "Review PR {{repo}}#{{pr_number}}: {{pr_title}}"
+
+[trigger.router.onActivity]
+kind = "honeybee"
+run = "buz"
+target = "{{binding.target}}"
+tier = "queue"
+subject = "{{event_kind}}"
+message = "{{activity_markdown}}"
+
+[trigger.router.onClose]
+kind = "honeybee"
+run = "kill"
+target = "{{binding.target}}"
+```
+
+Inspect runtime subject-to-target bindings with:
+
+```sh
+pollinate bindings
+pollinate bindings get <binding-id>
+```
+
 ## CLI-Only Creation
 
 You do not need to write TOML for common triggers:

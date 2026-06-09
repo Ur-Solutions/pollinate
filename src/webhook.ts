@@ -118,7 +118,7 @@ export class WebhookServer {
       return;
     }
     const dispatchTrigger = trigger;
-    const transformed = applyWebhookTransform(trigger.source.webhook, payload);
+    const transformed = trigger.router ? payload : applyWebhookTransform(trigger.source.webhook, payload);
     const updated = await recordWebhookDelivery(this.store, trigger);
     this.replaceTrigger(updated);
     send(response, 202, { accepted: true, trigger_id: trigger.id });
@@ -130,11 +130,19 @@ export class WebhookServer {
       at: nowIso(),
       response_ms: Date.now() - started,
     });
-    void this.dispatch(dispatchTrigger, transformed, request.socket.remoteAddress ?? "unknown");
+    void this.dispatch(dispatchTrigger, transformed, request.socket.remoteAddress ?? "unknown", {
+      path,
+      headers: normalizedHeaders(request.headers),
+    });
   }
 
-  private async dispatch(trigger: Trigger, payload: JsonValue, _sourceIp: string): Promise<void> {
-    const activation: Activation = { triggerId: trigger.id, source: "webhook", payload, receivedAt: nowIso() };
+  private async dispatch(
+    trigger: Trigger,
+    payload: JsonValue,
+    _sourceIp: string,
+    webhook?: { path?: string; headers?: Record<string, string> },
+  ): Promise<void> {
+    const activation: Activation = { triggerId: trigger.id, source: "webhook", payload, receivedAt: nowIso(), metadata: webhook ? { webhook } : undefined };
     await this.delivery.handle(trigger, activation);
   }
 
@@ -192,6 +200,15 @@ function validHexHmacSignature(algorithm: "sha1" | "sha256", secret: string, raw
 
 function headerValue(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
+}
+
+function normalizedHeaders(headers: IncomingMessage["headers"]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    const selected = headerValue(value);
+    if (selected !== undefined) out[key.toLowerCase()] = selected;
+  }
+  return out;
 }
 
 function normalizeJsonValue(value: unknown): JsonValue {

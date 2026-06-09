@@ -9,13 +9,15 @@ import {
   ledgerPath,
   readJsonOr,
   readTextOrNull,
+  routerBindingsDir,
   stateDir,
   storeRoot,
   triggerDir,
+  withFileLock,
   writeJson,
 } from "./fsx.js";
 import { idFromPath, parseDaemonConfigToml, parseTriggerToml, triggerToToml } from "./config.js";
-import type { CursorState, DaemonConfig, DeliveryState, Job, JobStatus, LedgerEvent, ScheduleState, Trigger } from "./types.js";
+import type { CursorState, DaemonConfig, DeliveryState, Job, JobStatus, LedgerEvent, RouterBinding, ScheduleState, Trigger } from "./types.js";
 import { nowIso } from "./time.js";
 import { allocateJobIdentity, matchesJobReference, type JobIdentity } from "./job-ids.js";
 
@@ -36,6 +38,14 @@ export class PollinateStore {
 
   jobPath(id: string): string {
     return join(jobsDir(this.root), `${id}.json`);
+  }
+
+  routerBindingPath(triggerId: string, subjectKey: string): string {
+    return join(routerBindingsDir(this.root), safePathPart(triggerId), `${safePathPart(subjectKey)}.json`);
+  }
+
+  routerBindingLockPath(triggerId: string, subjectKey: string): string {
+    return join(routerBindingsDir(this.root), safePathPart(triggerId), `${safePathPart(subjectKey)}.lock`);
   }
 
   scheduleStatePath(): string {
@@ -132,6 +142,37 @@ export class PollinateStore {
     await writeJson(this.jobPath(job.id), job);
   }
 
+  async getRouterBinding(triggerId: string, subjectKey: string): Promise<RouterBinding | null> {
+    return readJsonOr<RouterBinding | null>(this.routerBindingPath(triggerId, subjectKey), null);
+  }
+
+  async saveRouterBinding(binding: RouterBinding): Promise<void> {
+    await this.ensure();
+    await writeJson(this.routerBindingPath(binding.triggerId, binding.subjectKey), binding);
+  }
+
+  async withRouterBindingLock<T>(triggerId: string, subjectKey: string, fn: () => Promise<T>): Promise<T> {
+    await this.ensure();
+    return withFileLock(this.routerBindingLockPath(triggerId, subjectKey), fn);
+  }
+
+  async listRouterBindings(options: { triggerId?: string } = {}): Promise<RouterBinding[]> {
+    await this.ensure();
+    const root = routerBindingsDir(this.root);
+    const triggerDirs = options.triggerId ? [safePathPart(options.triggerId)] : await readdir(root).catch(() => []);
+    const bindings: RouterBinding[] = [];
+    for (const triggerDirName of triggerDirs.sort()) {
+      const dir = join(root, triggerDirName);
+      const entries = await readdir(dir).catch(() => []);
+      for (const entry of entries.filter((item) => item.endsWith(".json")).sort()) {
+        const binding = await readJsonOr<RouterBinding | null>(join(dir, entry), null);
+        if (binding && (!options.triggerId || binding.triggerId === options.triggerId)) bindings.push(binding);
+      }
+    }
+    bindings.sort((a, b) => (b.lastActivityAt ?? b.updatedAt).localeCompare(a.lastActivityAt ?? a.updatedAt));
+    return bindings;
+  }
+
   async allocateJobIdentity(trigger: Trigger): Promise<JobIdentity> {
     await this.ensure();
     return allocateJobIdentity({ root: this.root, trigger });
@@ -207,4 +248,9 @@ export class PollinateStore {
     const all = text.split(/\n/).filter(Boolean);
     return lines ? all.slice(-lines) : all;
   }
+}
+
+function safePathPart(value: string): string {
+  const safe = value.replace(/[^A-Za-z0-9_.:-]+/g, "-").replace(/^-+|-+$/g, "");
+  return safe || "binding";
 }

@@ -37,6 +37,52 @@ payload = '{"text":"{{text}}","chat":"{{chat_id}}"}'
     expect(triggerToToml(trigger)).toContain('cwd = "/tmp/pollinate-repo"');
   });
 
+  test("parses router trigger config without a static action", () => {
+    const trigger = parseTriggerToml(`
+[trigger]
+id = "github-pr-events"
+name = "GitHub PR events"
+enabled = true
+
+[trigger.source]
+kind = "webhook"
+[trigger.source.webhook]
+path = "github/pr-events"
+
+[trigger.delivery]
+mode = "immediate"
+maxConcurrent = 2
+
+[trigger.router]
+plugin = "github-pr"
+openOn = ["github.pull_request.opened"]
+closeOn = ["github.pull_request.merged"]
+
+[trigger.router.onOpen]
+kind = "honeybee"
+run = "spawn"
+bee = "codex"
+name = "pr-{{repo_slug}}-{{pr_number}}"
+message = "Review {{repo}}#{{pr_number}}"
+
+[trigger.router.onActivity]
+kind = "honeybee"
+run = "buz"
+target = "{{binding.target}}"
+message = "{{activity_markdown}}"
+
+[trigger.router.onClose]
+kind = "honeybee"
+run = "kill"
+target = "{{binding.target}}"
+`);
+    expect(trigger.action).toBeUndefined();
+    expect(trigger.router?.plugin).toBe("github-pr");
+    expect(trigger.router?.onOpen.kind).toBe("honeybee");
+    expect(trigger.router?.onOpen.run).toBe("spawn");
+    expect(triggerToToml(trigger)).toContain('plugin = "github-pr"');
+  });
+
   test("computes cron and interval next fires", () => {
     const next = nextCronFireAfter("0 8 * * 1-5", new Date("2026-06-08T05:59:00.000Z"), "Europe/Oslo");
     expect(next.toISOString()).toBe("2026-06-08T06:00:00.000Z");

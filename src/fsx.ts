@@ -19,6 +19,10 @@ export function jobsDir(root = storeRoot()): string {
   return join(root, "jobs");
 }
 
+export function routerBindingsDir(root = storeRoot()): string {
+  return join(stateDir(root), "router-bindings");
+}
+
 export function ledgerPath(root = storeRoot()): string {
   return join(root, "ledger.jsonl");
 }
@@ -31,6 +35,7 @@ export async function ensureStore(root = storeRoot()): Promise<void> {
   await mkdir(triggerDir(root), { recursive: true, mode: 0o700 });
   await mkdir(stateDir(root), { recursive: true, mode: 0o700 });
   await mkdir(jobsDir(root), { recursive: true, mode: 0o700 });
+  await mkdir(routerBindingsDir(root), { recursive: true, mode: 0o700 });
 }
 
 export async function atomicWriteFile(path: string, data: string | Buffer, options: { mode?: number } = {}): Promise<void> {

@@ -8,6 +8,8 @@ export * from "./hooks.js";
 export * from "./jsonpath.js";
 export * from "./job-ids.js";
 export * from "./poll.js";
+export * from "./router.js";
+export * from "./router-plugins/index.js";
 export * from "./schedule.js";
 export * from "./satellite.js";
 export * from "./secrets.js";

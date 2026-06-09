@@ -58,7 +58,20 @@ export type BuzTier = "interrupt" | "queue" | "passive";
 export type HoneybeeAction =
   | { kind: "honeybee"; run: "flow"; flow: string; args?: Record<string, string> }
   | { kind: "honeybee"; run: "loop"; loop: Record<string, JsonValue> }
-  | { kind: "honeybee"; run: "spawn"; bee: string; name?: string; colony?: string; cwd?: string; message?: string; timeout?: string }
+  | {
+      kind: "honeybee";
+      run: "spawn";
+      bee: string;
+      name?: string;
+      colony?: string;
+      home?: string;
+      cwd?: string;
+      yolo?: boolean;
+      acceptTrust?: boolean;
+      args?: string[];
+      message?: string;
+      timeout?: string;
+    }
   | { kind: "honeybee"; run: "send"; target: string; message: string; timeout?: string }
   | { kind: "honeybee"; run: "buz"; target: string; message: string; tier?: BuzTier; subject?: string; senderHuman?: string; timeout?: string }
   | { kind: "honeybee"; run: "kill"; target: string; timeout?: string };
@@ -81,6 +94,16 @@ export type ContextResolver = {
   static?: Record<string, string>;
 };
 
+export type RouterConfig = {
+  plugin: string;
+  openOn: string[];
+  closeOn: string[];
+  idleTtl?: string;
+  onOpen: Action;
+  onActivity: Action;
+  onClose?: Action;
+};
+
 export type TriggerLifecycle = {
   temporary?: boolean;
   expiresAt?: string;
@@ -100,7 +123,8 @@ export type Trigger = {
   delivery: Delivery;
   context?: ContextResolver;
   lifecycle?: TriggerLifecycle;
-  action: Action;
+  router?: RouterConfig;
+  action?: Action;
   createdAt: string;
   updatedAt: string;
 };
@@ -123,7 +147,7 @@ export type Job = {
   status: JobStatus;
   cwd?: string;
   context: Record<string, string>;
-  action: Action;
+  action?: Action;
   result?: unknown;
   error?: string;
   queuedAt: string;
@@ -137,6 +161,39 @@ export type Activation = {
   source: SourceKind;
   payload: JsonValue;
   receivedAt: string;
+  metadata?: {
+    webhook?: {
+      path?: string;
+      headers?: Record<string, string>;
+    };
+  };
+};
+
+export type CanonicalRouterEvent = {
+  subjectKey: string;
+  kind: string;
+  payload: JsonObject;
+};
+
+export type RouterBindingStatus = "pending" | "active" | "closing" | "closed" | "errored";
+
+export type RouterBindingTarget = {
+  kind: "hive";
+  handle: string;
+};
+
+export type RouterBinding = {
+  id: string;
+  triggerId: string;
+  router: string;
+  subjectKey: string;
+  status: RouterBindingStatus;
+  target?: RouterBindingTarget;
+  createdAt: string;
+  updatedAt: string;
+  lastActivityAt?: string;
+  lastEventKind?: string;
+  error?: string;
 };
 
 export type ScheduleState = Record<
@@ -199,6 +256,6 @@ export type DryRunResult = {
   triggerId: string;
   cwd?: string;
   context: Record<string, string>;
-  action: Action;
+  action?: Action;
   warnings: string[];
 };

@@ -37,7 +37,7 @@ import {
   table,
   truncate,
 } from "./ui.js";
-import type { Action, Activation, ContextResolver, Delivery, Filter, Job, JobStatus, JsonValue, MissedFirePolicy, Source, SourceKind, Trigger } from "./types.js";
+import type { Action, Activation, ContextResolver, Delivery, Filter, Job, JobStatus, JsonValue, MissedFirePolicy, RouterConfig, Source, SourceKind, Trigger } from "./types.js";
 
 type ParsedArgs = {
   command?: string;
@@ -88,6 +88,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     case "jobs":
       await cmdJobs(await getStore(), args);
       return;
+    case "bindings":
+      await cmdBindings(await getStore(), args);
+      return;
     case "job":
       await cmdJob(await getStore(), args);
       return;
@@ -128,6 +131,9 @@ async function cmdAdd(store: PollinateStore, args: ParsedArgs): Promise<void> {
 async function cmdCreate(store: PollinateStore, args: ParsedArgs): Promise<void> {
   const id = slugify(requiredArg(args.rest[0], "Usage: pollinate create <id> --source <kind> --action <kind> [flags]"));
   const now = nowIso();
+  const router = routerFromFlags(args);
+  const action = actionFromFlagsOptional(args);
+  if (!router && !action) throw new Error("Create requires --action <kind>, --action-json, or --router-json");
   const trigger: Trigger = {
     id,
     name: stringFlag(args, "name") ?? id,
@@ -139,7 +145,8 @@ async function cmdCreate(store: PollinateStore, args: ParsedArgs): Promise<void>
     filter: filterFromFlags(args),
     delivery: deliveryFromFlags(args),
     context: contextFromFlags(args),
-    action: actionFromFlags(args),
+    router,
+    action,
     createdAt: now,
     updatedAt: now,
   };
@@ -240,10 +247,10 @@ function renderDryRun(trigger: Trigger, dryRun: DryRunResult): string {
     "",
     fields([
       ["context", describeContext(dryRun.context)],
-      ["action", describeAction(dryRun.action)],
+      dryRun.action ? ["action", describeAction(dryRun.action)] : ["action", c.dim("none")],
     ]),
   ];
-  const detail = actionDetail(dryRun.action);
+  const detail = dryRun.action ? actionDetail(dryRun.action) : undefined;
   if (detail) lines.push(field("", c.dim(detail), "context".length));
   if (dryRun.warnings.length) {
     lines.push("");
@@ -271,6 +278,57 @@ async function cmdJobs(store: PollinateStore, args: ParsedArgs): Promise<void> {
   const last = numberFlag(args, "last");
   const jobs = await store.listJobs({ status, triggerId, last });
   print(args, jobs, renderJobList(jobs));
+}
+
+async function cmdBindings(store: PollinateStore, args: ParsedArgs): Promise<void> {
+  if (args.rest[0] === "get") {
+    const id = requiredArg(args.rest[1], "Usage: pollinate bindings get <bindingId>");
+    const bindings = await store.listRouterBindings();
+    const binding = bindings.find((item) => item.id === id);
+    if (!binding) throw new Error(`No router binding found with id "${id}"`);
+    print(args, binding, renderBinding(binding));
+    return;
+  }
+  const bindings = await store.listRouterBindings({ triggerId: stringFlag(args, "trigger") });
+  print(args, bindings, renderBindingList(bindings));
+}
+
+type BindingRow = Awaited<ReturnType<PollinateStore["listRouterBindings"]>>[number];
+
+function renderBindingList(bindings: BindingRow[]): string {
+  if (!bindings.length) return c.dim("No router bindings yet.");
+  const rows = bindings.map((binding) => [
+    bindingStatus(binding.status),
+    c.dim(binding.id),
+    c.bold(binding.triggerId),
+    c.cyan(binding.subjectKey),
+    binding.target?.handle ?? c.dim("-"),
+    relativeTime(binding.lastActivityAt ?? binding.updatedAt),
+  ]);
+  return table(rows, { head: ["status", "id", "trigger", "subject", "target", "activity"] });
+}
+
+function renderBinding(binding: BindingRow): string {
+  return [
+    `${bindingStatus(binding.status)}  ${c.dim("binding")} ${c.bold(binding.id)}`,
+    "",
+    fields([
+      ["trigger", binding.triggerId],
+      ["router", binding.router],
+      ["subject", binding.subjectKey],
+      ["status", binding.status],
+      binding.target ? ["target", `${binding.target.kind}:${binding.target.handle}`] : null,
+      binding.lastEventKind ? ["last event", binding.lastEventKind] : null,
+      binding.error ? ["error", c.red(binding.error)] : null,
+    ]),
+  ].join("\n");
+}
+
+function bindingStatus(status: BindingRow["status"]): string {
+  if (status === "active") return c.green("active");
+  if (status === "pending" || status === "closing") return c.yellow(status);
+  if (status === "errored") return c.red(status);
+  return c.gray(status);
 }
 
 function renderJobList(jobs: Job[]): string {
@@ -310,7 +368,7 @@ function renderJob(job: Job): string {
       job.completedAt ? ["finished", timestampField(job.completedAt)] : null,
       took ? ["duration", formatDuration(took)] : null,
       job.cwd ? ["cwd", c.dim(job.cwd)] : null,
-      ["action", describeAction(job.action)],
+      job.action ? ["action", describeAction(job.action)] : null,
       Object.keys(job.context).length ? ["context", describeContext(job.context)] : null,
     ]),
   ];
@@ -381,8 +439,19 @@ async function cmdHook(store: PollinateStore, args: ParsedArgs): Promise<void> {
   const trigger = await store.requireTrigger(requiredArg(args.rest[1], "Usage: pollinate hook test <id> --payload '{...}'"));
   if (trigger.source.kind !== "webhook") throw new Error(`Trigger ${trigger.id} is not a webhook trigger`);
   const payload = parsePayload(stringFlag(args, "payload") ?? "{}");
-  const transformed = applyWebhookTransform(trigger.source.webhook, payload);
-  const activation: Activation = { triggerId: trigger.id, source: "webhook", payload: transformed, receivedAt: nowIso() };
+  const transformed = trigger.router ? payload : applyWebhookTransform(trigger.source.webhook, payload);
+  const activation: Activation = {
+    triggerId: trigger.id,
+    source: "webhook",
+    payload: transformed,
+    receivedAt: nowIso(),
+    metadata: {
+      webhook: {
+        path: trigger.source.webhook.path,
+        headers: keyValueRecord(flagValues(args, "header")) ?? {},
+      },
+    },
+  };
   const executor = await newExecutor(store);
   const job = await executor.createQueuedJob(trigger, activation, [transformed]);
   await store.saveJob(job);
@@ -461,6 +530,11 @@ async function createHookFromArgs(store: PollinateStore, args: ParsedArgs, defau
 function actionFromFlagsOrDefault(args: ParsedArgs, fallback: Action): Action {
   if (stringFlag(args, "action") || stringFlag(args, "action-json") || stringFlag(args, "command")) return actionFromFlags(args);
   return fallback;
+}
+
+function actionFromFlagsOptional(args: ParsedArgs): Action | undefined {
+  if (stringFlag(args, "action") || stringFlag(args, "action-json") || stringFlag(args, "command")) return actionFromFlags(args);
+  return undefined;
 }
 
 function hookCreateJson(created: HookCreateResult): Record<string, unknown> {
@@ -686,7 +760,7 @@ async function newExecutor(store: PollinateStore): Promise<ActionExecutor> {
 function renderTrigger(trigger: Trigger): string {
   const state = trigger.enabled ? c.green("enabled") : c.gray("disabled");
   const headline = `${c.accent(sym.flower)} ${c.bold(trigger.id)}  ${statusDot(trigger.enabled)} ${state}`;
-  const subtitle = c.dim(`${trigger.source.kind} ${sym.arrow} ${trigger.action.kind}`);
+  const subtitle = c.dim(`${trigger.source.kind} ${sym.arrow} ${trigger.router ? `router:${trigger.router.plugin}` : trigger.action?.kind ?? "none"}`);
   const pairs: Array<[string, string] | null> = [
     trigger.name && trigger.name !== trigger.id ? ["name", trigger.name] : null,
     trigger.description ? ["description", trigger.description] : null,
@@ -696,10 +770,11 @@ function renderTrigger(trigger: Trigger): string {
     ["delivery", describeDelivery(trigger.delivery)],
     trigger.filter ? ["filter", c.dim(compactJson(trigger.filter))] : null,
     trigger.context ? ["context", describeContext(contextVars(trigger.context))] : null,
-    ["action", describeAction(trigger.action)],
+    trigger.router ? ["router", describeRouter(trigger.router)] : null,
+    trigger.action ? ["action", describeAction(trigger.action)] : null,
   ];
   const lines = [headline, subtitle, "", fields(pairs)];
-  const detail = actionDetail(trigger.action);
+  const detail = trigger.action ? actionDetail(trigger.action) : undefined;
   if (detail) {
     const labelWidth = Math.max(...(pairs.filter(Boolean) as [string, string][]).map(([l]) => l.length));
     lines.push(field("", c.dim(detail), labelWidth));
@@ -712,7 +787,7 @@ function renderTrigger(trigger: Trigger): string {
 // --- shared rendering helpers ---------------------------------------------
 
 function triggerSummary(trigger: Trigger): string {
-  return `${trigger.source.kind} ${sym.arrow} ${trigger.action.kind}`;
+  return `${trigger.source.kind} ${sym.arrow} ${trigger.router ? `router:${trigger.router.plugin}` : trigger.action?.kind ?? "none"}`;
 }
 
 function sourceDetail(source: Source): string {
@@ -773,6 +848,10 @@ function describeAction(action: Action): string {
     default:
       return (action as { kind: string }).kind;
   }
+}
+
+function describeRouter(router: NonNullable<Trigger["router"]>): string {
+  return `${c.bold(router.plugin)} ${c.dim(`${sym.mid} open ${router.openOn.length} close ${router.closeOn.length}`)}`;
 }
 
 function actionDetail(action: Action): string | undefined {
@@ -1023,7 +1102,11 @@ function actionFromFlags(args: ParsedArgs): Action {
       bee: requiredFlag(args, "bee", "Honeybee spawn actions require --bee <kind>"),
       name: stringFlag(args, "name"),
       colony: stringFlag(args, "colony"),
+      home: stringFlag(args, "home"),
       cwd: stringFlag(args, "cwd"),
+      yolo: args.flags.yolo === true ? true : args.flags["no-yolo"] === true ? false : undefined,
+      acceptTrust: args.flags["accept-trust"] === true ? true : args.flags["no-accept-trust"] === true ? false : undefined,
+      args: flagValues(args, "bee-arg"),
       message: stringFlag(args, "message") ?? stringFlag(args, "prompt"),
       timeout: stringFlag(args, "timeout"),
     };
@@ -1060,6 +1143,10 @@ function actionFromFlags(args: ParsedArgs): Action {
     };
   }
   throw new Error("Create requires --action <command|http|emit|hermes|honeybee-flow|honeybee-loop|honeybee-spawn|honeybee-send|honeybee-buz|honeybee-kill> or --action-json");
+}
+
+function routerFromFlags(args: ParsedArgs): RouterConfig | undefined {
+  return jsonFlag<RouterConfig>(args, "router-json");
 }
 
 function contextFromFlags(args: ParsedArgs): ContextResolver | undefined {
@@ -1169,7 +1256,7 @@ function optionalFlagValue(key: string, next: string | undefined, consume: (valu
 }
 
 function flagValue(key: string, argv: string[], consume: () => string): string | boolean {
-  const booleanFlags = new Set(["json", "enabled", "disabled", "dry-run", "follow", "foreground", "collect"]);
+  const booleanFlags = new Set(["json", "enabled", "disabled", "dry-run", "follow", "foreground", "collect", "yolo", "no-yolo", "accept-trust", "no-accept-trust"]);
   if (booleanFlags.has(key)) return true;
   const value = consume();
   if (value === undefined || value.startsWith("-")) throw new Error(`--${key} requires a value`);
@@ -1262,6 +1349,8 @@ async function printHelp(): Promise<void> {
       ["trigger <id> [--dry-run]", "fire now; --payload '{…}' to pass data"],
       ["jobs [--status <s>] [--last n]", "list recent jobs"],
       ["job <jobId> | job cancel <id>", "inspect or cancel a job"],
+      ["bindings [--trigger <id>]", "list router subject→target bindings"],
+      ["bindings get <id>", "inspect a router binding"],
       ["hooks", "list webhook endpoints"],
       ["hook create <id> [--ttl 10m]", "create a temporary webhook URL"],
       ["hook inbox [id]", "create a temporary emit-only webhook"],
@@ -1293,11 +1382,12 @@ async function printHelp(): Promise<void> {
     ["--action command", "--command 'echo {{event}}'"],
     ["--action http", "--method POST --url https://… [--body '{{event}}']"],
     ["--action emit", "--subject some.event [--payload '{\"k\":\"{{var}}\"}']"],
+    ["--router-json", "configure a router trigger from JSON"],
   ];
   const scWidth = Math.max(...shortcuts.map(([k]) => k.length));
   for (const [k, v] of shortcuts) out.push(`  ${c.cyan(pad(k, scWidth))}   ${c.dim(v)}`);
   out.push("");
-  out.push(c.dim(`  ${sym.mid} --source-json / --delivery-json / --action-json / --context-json / --filter-json for full control`));
+  out.push(c.dim(`  ${sym.mid} --source-json / --delivery-json / --action-json / --router-json / --context-json / --filter-json for full control`));
   out.push(c.dim(`  ${sym.mid} add ${c.bold("--json")} to any command for machine-readable output`));
   out.push("");
   out.push(c.dim(`Examples:`));

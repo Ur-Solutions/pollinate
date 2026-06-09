@@ -4,6 +4,7 @@ import { resolveContext } from "./context.js";
 import { renderAction, renderString } from "./templates.js";
 import { execShell, shellQuote } from "./process.js";
 import { nowIso, parseDuration } from "./time.js";
+import { executeRouter } from "./router.js";
 
 export type ActionExecutorOptions = {
   contextTimeoutMs: number;
@@ -11,7 +12,7 @@ export type ActionExecutorOptions = {
   execution?: ExecutionProfile;
 };
 
-type ActionResult = { timedOut?: boolean; [key: string]: unknown };
+export type ActionResult = { timedOut?: boolean; [key: string]: unknown };
 
 export class ActionExecutor {
   constructor(
@@ -37,7 +38,23 @@ export class ActionExecutor {
   }
 
   async dryRun(trigger: Trigger, activation: Activation, batch: JsonValue[] = [activation.payload]): Promise<DryRunResult> {
+    if (trigger.router && !trigger.action) {
+      return {
+        triggerId: trigger.id,
+        cwd: trigger.cwd,
+        context: {
+          trigger_id: trigger.id,
+          source_kind: activation.source,
+          event: JSON.stringify(activation.payload),
+          batch: JSON.stringify(batch),
+          batch_count: String(batch.length),
+        },
+        action: trigger.router.onOpen,
+        warnings: ["Router dry-run renders the configured onOpen action only; it does not normalize or route events."],
+      };
+    }
     const resolved = await this.buildContext(trigger, activation, batch, trigger.cwd);
+    if (!trigger.action) throw new Error(`Trigger ${trigger.id} has no action`);
     const rendered = this.renderJobInputs(trigger.action, trigger.cwd, resolved.context);
     return {
       triggerId: trigger.id,
@@ -51,9 +68,11 @@ export class ActionExecutor {
   async executeJob(job: Job, trigger: Trigger, activation: Activation, batch: JsonValue[]): Promise<Job> {
     const cancellation = await this.store.getJob(job.id);
     if (cancellation?.status === "cancelled") return cancellation;
+    if (trigger.router && !job.action) return this.executeRouterJob(job, trigger, activation, batch);
     await this.store.updateJob(job.id, { status: "resolving-context" });
     const jobCwd = job.cwd ?? trigger.cwd;
     const resolved = await this.buildContext(trigger, activation, batch, jobCwd);
+    if (!job.action) throw new Error(`Job ${job.id} has no action`);
     const rendered = this.renderJobInputs(job.action, jobCwd, resolved.context);
     const warnings = resolved.warnings.concat(rendered.warnings);
     const running = await this.store.updateJob(job.id, {
@@ -88,6 +107,43 @@ export class ActionExecutor {
     }
   }
 
+  private async executeRouterJob(job: Job, trigger: Trigger, activation: Activation, batch: JsonValue[]): Promise<Job> {
+    const running = await this.store.updateJob(job.id, {
+      status: "running",
+      cwd: job.cwd ?? trigger.cwd,
+      context: {
+        event: JSON.stringify(activation.payload),
+        batch: JSON.stringify(batch),
+        batch_count: String(batch.length),
+      },
+      startedAt: nowIso(),
+    });
+    await this.store.appendLedger({ event: "pollinate.job.started", job_id: job.id, trigger_id: trigger.id, action_kind: "router", cwd: running.cwd });
+    try {
+      const result = await executeRouter({
+        store: this.store,
+        executor: this,
+        trigger,
+        activation,
+        cwd: running.cwd,
+      });
+      const completed = await this.store.updateJob(job.id, { status: "completed", result, completedAt: nowIso() });
+      await this.store.appendLedger({
+        event: "pollinate.job.completed",
+        job_id: job.id,
+        trigger_id: trigger.id,
+        duration_ms: running.startedAt ? Date.now() - new Date(running.startedAt).getTime() : undefined,
+        warnings: [],
+      });
+      return completed;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const errored = await this.store.updateJob(job.id, { status: "errored", error: message, completedAt: nowIso() });
+      await this.store.appendLedger({ event: "pollinate.job.errored", job_id: job.id, trigger_id: trigger.id, error: message });
+      return errored;
+    }
+  }
+
   private async buildContext(trigger: Trigger, activation: Activation, batch: JsonValue[], cwd?: string) {
     const resolved = await resolveContext(trigger, activation, { defaultTimeoutMs: this.options.contextTimeoutMs, cwd, execution: this.options.execution });
     return {
@@ -110,7 +166,7 @@ export class ActionExecutor {
     };
   }
 
-  private async executeAction(action: Action, cwd?: string): Promise<ActionResult> {
+  async executeAction(action: Action, cwd?: string): Promise<ActionResult> {
     if (action.kind === "command") {
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
       const result = await execShell(action.command, { cwd: action.cwd ?? cwd, timeoutMs, execution: this.options.execution });
@@ -187,10 +243,15 @@ export class ActionExecutor {
       const flags = flagsFromRecord({
         ...(action.name ? { name: action.name } : {}),
         ...(action.colony ? { colony: action.colony } : {}),
+        ...(action.home ? { home: action.home } : {}),
         ...(spawnCwd ? { cwd: spawnCwd } : {}),
+        ...(action.yolo === true ? { yolo: true } : {}),
       });
+      if (action.yolo === false) flags.push("--no-yolo");
+      if (action.acceptTrust === false) flags.push("--no-accept-trust");
+      const beeArgs = action.args?.length ? ["--", ...action.args] : [];
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-      return execShell(["hive", "spawn", shellQuote(action.bee), ...flags.map(shellQuote)].join(" "), {
+      return execShell(["hive", "spawn", shellQuote(action.bee), ...flags.map(shellQuote), ...beeArgs.map(shellQuote)].join(" "), {
         cwd: spawnCwd,
         timeoutMs,
         execution: this.options.execution,
