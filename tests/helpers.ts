@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { vi } from "vitest";
@@ -15,7 +15,21 @@ export async function withTempStore<T>(fn: (store: PollinateStore, root: string)
   } finally {
     if (previous === undefined) delete process.env.POLLINATE_STORE_ROOT;
     else process.env.POLLINATE_STORE_ROOT = previous;
-    await rm(root, { recursive: true, force: true });
+    await removeWithRetry(root);
+  }
+}
+
+// In-flight async writes (poll ticks, ledger appends) can land while rm walks
+// the tree, surfacing as ENOTEMPTY; retry briefly instead of failing the test.
+async function removeWithRetry(root: string, attempts = 5): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await rm(root, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (attempt >= attempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50 * attempt));
+    }
   }
 }
 
@@ -59,4 +73,56 @@ export async function waitForTerminalJobs(store: PollinateStore, count: number, 
 
 export function useFakeTimers(): void {
   vi.useFakeTimers({ shouldAdvanceTime: true });
+}
+
+export type CommandStub = {
+  binDir: string;
+  logPath: string;
+  log(): Promise<string>;
+  restore(): void;
+};
+
+/**
+ * Installs a PATH-hijacking `hive` stub under <root>/bin. It logs every
+ * invocation to <root>/hive.log and answers `spawn` with a hive-style TSV row
+ * whose handle echoes --name (or "spawned" when no name was passed).
+ */
+export async function installHiveStub(root: string, options: { script?: string } = {}): Promise<CommandStub> {
+  const logPath = join(root, "hive.log");
+  return installCommandStub(root, "hive", options.script ?? defaultHiveScript(logPath), logPath);
+}
+
+/** Installs an arbitrary PATH-hijacking command stub next to the hive stub. */
+export async function installCommandStub(root: string, name: string, script: string, logPath = join(root, `${name}.log`)): Promise<CommandStub> {
+  const binDir = join(root, "bin");
+  await mkdir(binDir, { recursive: true });
+  await writeFile(join(binDir, name), script);
+  await chmod(join(binDir, name), 0o700);
+  const previousPath = process.env.PATH;
+  if (!previousPath?.split(":").includes(binDir)) process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+  return {
+    binDir,
+    logPath,
+    log: () => readFile(logPath, "utf8").catch(() => ""),
+    restore() {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    },
+  };
+}
+
+function defaultHiveScript(logPath: string): string {
+  return `#!/bin/sh
+echo "$@" >> "${logPath}"
+if [ "$1" = "spawn" ]; then
+  name="spawned"
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "--name" ]; then name="$arg"; fi
+    prev="$arg"
+  done
+  printf '%s\\tcodex\\t/tmp\\tlocal\\n' "$name"
+fi
+cat >/dev/null
+`;
 }

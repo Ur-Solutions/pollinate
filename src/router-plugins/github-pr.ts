@@ -1,4 +1,5 @@
-import type { CanonicalRouterEvent, JsonObject, JsonValue } from "../types.js";
+import { execArgv } from "../process.js";
+import type { CanonicalRouterEvent, ExecutionProfile, JsonObject, JsonValue } from "../types.js";
 
 export type RouterPluginInput = {
   headers: Record<string, string>;
@@ -6,12 +7,24 @@ export type RouterPluginInput = {
   path?: string;
 };
 
+export type RouterSubjectState = "open" | "closed" | "unknown";
+
+export type RouterSubjectStateOptions = {
+  cwd?: string;
+  timeoutMs?: number;
+  execution?: ExecutionProfile;
+};
+
 export type RouterPlugin = {
   name: string;
   normalize(input: RouterPluginInput): CanonicalRouterEvent[] | Promise<CanonicalRouterEvent[]>;
+  /** Optional: report whether the subject behind a binding is still open, for GC reconciliation. */
+  subjectState?(subjectKey: string, options?: RouterSubjectStateOptions): RouterSubjectState | Promise<RouterSubjectState>;
 };
 
 type AnyRecord = Record<string, unknown>;
+
+const SUBJECT_KEY_RE = /^github:pull_request:([^#\s]+)#(\d+)$/;
 
 export const githubPrRouterPlugin: RouterPlugin = {
   name: "github-pr",
@@ -27,6 +40,25 @@ export const githubPrRouterPlugin: RouterPlugin = {
     if (event === "check_run") return normalizeCheck(body, "check_run");
     if (event === "check_suite") return normalizeCheck(body, "check_suite");
     return [];
+  },
+  async subjectState(subjectKey, options = {}) {
+    const match = SUBJECT_KEY_RE.exec(subjectKey);
+    if (!match) return "unknown";
+    const [, repo, number] = match;
+    try {
+      const result = await execArgv("gh", ["pr", "view", number!, "--repo", repo!, "--json", "state"], {
+        cwd: options.cwd,
+        timeoutMs: options.timeoutMs ?? 30_000,
+        execution: options.execution,
+      });
+      if (result.exitCode !== 0) return "unknown";
+      const state = String((JSON.parse(result.stdout) as { state?: unknown }).state ?? "").toUpperCase();
+      if (state === "OPEN") return "open";
+      if (state === "CLOSED" || state === "MERGED") return "closed";
+      return "unknown";
+    } catch {
+      return "unknown";
+    }
   },
 };
 
@@ -54,6 +86,7 @@ function normalizeIssueComment(body: AnyRecord): CanonicalRouterEvent[] {
     eventForNumber(body, repo, number, `github.issue_comment.${action}`, clean({
       pr_url: stringValue(asRecord(issue.pull_request)?.html_url),
       pr_title: stringValue(issue.title),
+      pr_author: stringValue(asRecord(issue.user)?.login),
       activity_url: stringValue(comment?.html_url),
       comment_body: stringValue(comment?.body),
     })),
@@ -117,6 +150,7 @@ function eventForPr(body: AnyRecord, repo: string, pr: AnyRecord, kind: string, 
     pr_url: stringValue(pr.html_url),
     pr_title: stringValue(pr.title),
     pr_state: stringValue(pr.state),
+    pr_author: stringValue(asRecord(pr.user)?.login),
     ...extra,
   }));
 }

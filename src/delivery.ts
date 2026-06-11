@@ -1,5 +1,6 @@
 import type { Activation, DeliveryState, Job, JsonValue, Trigger } from "./types.js";
 import { ActionExecutor } from "./actions.js";
+import { matchesFilter } from "./filter.js";
 import { PollinateStore } from "./store.js";
 import { nowIso, parseDuration } from "./time.js";
 
@@ -32,7 +33,7 @@ export class DeliveryManager {
 
   async handle(trigger: Trigger, activation: Activation): Promise<Job | null> {
     if (!trigger.enabled) return null;
-    if (!matchesFilter(trigger, activation.payload)) {
+    if (!matchesFilter(trigger.filter, activation.payload)) {
       await this.store.appendLedger({ event: "pollinate.delivery.filtered", trigger_id: trigger.id });
       return null;
     }
@@ -249,14 +250,4 @@ export class DeliveryManager {
   private async persist(): Promise<void> {
     await this.store.writeDeliveryState(this.persisted);
   }
-}
-
-function matchesFilter(trigger: Trigger, payload: JsonValue): boolean {
-  if (!trigger.filter) return true;
-  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return false;
-  const object = payload as Record<string, JsonValue>;
-  return Object.entries(trigger.filter).every(([key, expected]) => {
-    if (expected === true) return Object.prototype.hasOwnProperty.call(object, key);
-    return JSON.stringify(object[key]) === JSON.stringify(expected);
-  });
 }

@@ -9,8 +9,12 @@ import { resolveSecret } from "./secrets.js";
 import { validRelaySignature } from "./satellite.js";
 import { expireTemporaryHook, isExpiredTemporaryHook, recordWebhookDelivery } from "./hooks.js";
 
+const MAX_SEEN_DELIVERIES = 1_000;
+
 export class WebhookServer {
   private server?: http.Server;
+  /** Recently seen webhook delivery GUIDs (`<triggerId>:<x-github-delivery>`), insertion-ordered for eviction. */
+  private readonly seenDeliveries = new Set<string>();
 
   constructor(
     private readonly store: PollinateStore,
@@ -94,15 +98,18 @@ export class WebhookServer {
     try {
       if (route.kind === "relay") {
         if (!this.relay.secret) {
+          await this.ledgerRejection(trigger.id, path, "relay-not-enabled", request);
           send(response, 404, { error: "relay not enabled" });
           return;
         }
         if (!validRelaySignature({ secret: this.relay.secret, maxAgeSeconds: this.relay.maxAgeSeconds, path, raw, headers: request.headers })) {
+          await this.ledgerRejection(trigger.id, path, "invalid-relay-signature", request);
           send(response, 403, { error: "invalid relay signature" });
           return;
         }
       }
       if (!validSignature(trigger.source.webhook, raw, request.headers)) {
+        await this.ledgerRejection(trigger.id, path, "invalid-signature", request);
         send(response, 403, { error: "invalid signature" });
         return;
       }
@@ -115,6 +122,18 @@ export class WebhookServer {
       payload = raw.length ? (JSON.parse(raw.toString("utf8")) as JsonValue) : {};
     } catch {
       send(response, 400, { error: "invalid json" });
+      return;
+    }
+    const deliveryId = headerValue(request.headers["x-github-delivery"]);
+    if (deliveryId && this.isDuplicateDelivery(trigger.id, deliveryId)) {
+      send(response, 202, { accepted: true, duplicate: true, trigger_id: trigger.id });
+      await this.store.appendLedger({
+        event: "pollinate.webhook.duplicate",
+        trigger_id: trigger.id,
+        path,
+        delivery_id: deliveryId,
+        source_ip: request.socket.remoteAddress,
+      });
       return;
     }
     const dispatchTrigger = trigger;
@@ -148,6 +167,28 @@ export class WebhookServer {
 
   private replaceTrigger(updated: Trigger): void {
     this.triggers = this.triggers.map((trigger) => (trigger.id === updated.id ? updated : trigger));
+  }
+
+  private isDuplicateDelivery(triggerId: string, deliveryId: string): boolean {
+    const key = `${triggerId}:${deliveryId}`;
+    if (this.seenDeliveries.has(key)) return true;
+    this.seenDeliveries.add(key);
+    while (this.seenDeliveries.size > MAX_SEEN_DELIVERIES) {
+      const oldest = this.seenDeliveries.values().next().value;
+      if (oldest === undefined) break;
+      this.seenDeliveries.delete(oldest);
+    }
+    return false;
+  }
+
+  private async ledgerRejection(triggerId: string, path: string, reason: string, request: IncomingMessage): Promise<void> {
+    await this.store.appendLedger({
+      event: "pollinate.webhook.rejected",
+      trigger_id: triggerId,
+      path,
+      reason,
+      source_ip: request.socket.remoteAddress,
+    });
   }
 }
 

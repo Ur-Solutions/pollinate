@@ -1,8 +1,8 @@
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { ActionExecutor, DeliveryManager, WebhookServer, githubPrRouterPlugin, routerPluginsDir } from "../src/index.js";
-import { trigger, waitForTerminalJobs, withTempStore } from "./helpers.js";
+import { installHiveStub, trigger, waitForTerminalJobs, withTempStore } from "./helpers.js";
 
 describe("github-pr router plugin", () => {
   test("normalizes pull_request and issue_comment events to the same subject key", () => {
@@ -12,7 +12,7 @@ describe("github-pr router plugin", () => {
         action: "opened",
         repository: { full_name: "trmd/pollinate" },
         sender: { login: "alice" },
-        pull_request: { number: 123, html_url: "https://github.com/trmd/pollinate/pull/123", title: "Add router", state: "open" },
+        pull_request: { number: 123, html_url: "https://github.com/trmd/pollinate/pull/123", title: "Add router", state: "open", user: { login: "alice" } },
       },
     });
     const comment = githubPrRouterPlugin.normalize({
@@ -21,7 +21,7 @@ describe("github-pr router plugin", () => {
         action: "created",
         repository: { full_name: "trmd/pollinate" },
         sender: { login: "bob" },
-        issue: { number: 123, title: "Add router", pull_request: { html_url: "https://github.com/trmd/pollinate/pull/123" } },
+        issue: { number: 123, title: "Add router", user: { login: "alice" }, pull_request: { html_url: "https://github.com/trmd/pollinate/pull/123" } },
         comment: { body: "Can you review this?", html_url: "https://github.com/trmd/pollinate/pull/123#issuecomment-1" },
       },
     });
@@ -32,6 +32,8 @@ describe("github-pr router plugin", () => {
     expect(comment[0]?.subjectKey).toBe(opened[0]?.subjectKey);
     expect(opened[0]?.kind).toBe("github.pull_request.opened");
     expect(comment[0]?.kind).toBe("github.issue_comment.created");
+    expect(opened[0]?.payload.pr_author).toBe("alice");
+    expect(comment[0]?.payload.pr_author).toBe("alice");
   });
 
   test("ignores comments marked as pollinate router output", () => {
@@ -76,22 +78,7 @@ export default {
 };
 `,
       );
-      const bin = join(root, "bin");
-      await mkdir(bin, { recursive: true });
-      const hiveLog = join(root, "hive.log");
-      await writeFile(
-        join(bin, "hive"),
-        `#!/bin/sh
-echo "$@" >> "${hiveLog}"
-if [ "$1" = "spawn" ]; then
-  printf 'custom-target\\tcodex\\t/tmp\\tlocal\\n'
-fi
-cat >/dev/null
-`,
-      );
-      await chmod(join(bin, "hive"), 0o700);
-      const previousPath = process.env.PATH;
-      process.env.PATH = `${bin}:${previousPath ?? ""}`;
+      const hive = await installHiveStub(root);
       try {
         const trig = trigger({
           id: "custom-router",
@@ -126,38 +113,14 @@ cat >/dev/null
           await delivery.shutdown();
         }
       } finally {
-        if (previousPath === undefined) delete process.env.PATH;
-        else process.env.PATH = previousPath;
+        hive.restore();
       }
     });
   });
 
   test("webhook PR events create, route, and close one addressed hive target", async () => {
     await withTempStore(async (store, root) => {
-      const bin = join(root, "bin");
-      await mkdir(bin, { recursive: true });
-      const hiveLog = join(root, "hive.log");
-      await writeFile(
-        join(bin, "hive"),
-        `#!/bin/sh
-echo "$@" >> "${hiveLog}"
-if [ "$1" = "spawn" ]; then
-  name="spawned"
-  while [ "$#" -gt 0 ]; do
-    if [ "$1" = "--name" ]; then
-      shift
-      name="$1"
-    fi
-    shift
-  done
-  printf '%s\\tcodex\\t/tmp\\tlocal\\n' "$name"
-fi
-cat >/dev/null
-`,
-      );
-      await chmod(join(bin, "hive"), 0o700);
-      const previousPath = process.env.PATH;
-      process.env.PATH = `${bin}:${previousPath ?? ""}`;
+      const hive = await installHiveStub(root);
       try {
         const trig = trigger({
           id: "github-pr",
@@ -274,7 +237,7 @@ cat >/dev/null
           binding = await store.getRouterBinding("github-pr", "github:pull_request:trmd/pollinate#123");
           expect(binding?.status).toBe("closed");
 
-          const log = await readFile(hiveLog, "utf8");
+          const log = await hive.log();
           expect(log).toContain("spawn codex --name pr-trmd-pollinate-123");
           expect(log).toContain("--no-yolo -- --allowedTools Read");
           expect(log.match(/spawn codex/g)).toHaveLength(2);
@@ -287,38 +250,86 @@ cat >/dev/null
           await delivery.shutdown();
         }
       } finally {
-        if (previousPath === undefined) delete process.env.PATH;
-        else process.env.PATH = previousPath;
+        hive.restore();
+      }
+    });
+  });
+
+  test("openWhen filters open events that do not match the payload", async () => {
+    await withTempStore(async (store, root) => {
+      const hive = await installHiveStub(root);
+      try {
+        const trig = trigger({
+          id: "github-pr-mine",
+          source: { kind: "webhook", webhook: { path: "github/pr-mine" } },
+          action: undefined,
+          router: {
+            plugin: "github-pr",
+            openOn: ["github.pull_request.opened"],
+            closeOn: ["github.pull_request.merged"],
+            openWhen: { pr_author: "trmdy" },
+            onOpen: {
+              kind: "honeybee",
+              run: "spawn",
+              bee: "codex",
+              name: "pr-{{pr_number}}",
+              message: "Review {{repo}}#{{pr_number}}",
+            },
+            onActivity: { kind: "honeybee", run: "send", target: "{{binding.target}}", message: "{{activity_markdown}}" },
+          },
+        });
+        await store.saveTrigger(trig);
+        const delivery = new DeliveryManager(store, new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 }));
+        await delivery.init([trig]);
+        const server = new WebhookServer(store, delivery, [trig], "127.0.0.1", 0);
+        await server.start();
+        try {
+          const address = server.address();
+          if (!address) throw new Error("server did not bind");
+          const url = `http://127.0.0.1:${address.port}/hook/github/pr-mine`;
+
+          await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-github-event": "pull_request" },
+            body: JSON.stringify({
+              action: "opened",
+              repository: { full_name: "trmd/pollinate" },
+              sender: { login: "alice" },
+              pull_request: { number: 7, html_url: "https://github.com/trmd/pollinate/pull/7", title: "Not mine", state: "open", user: { login: "alice" } },
+            }),
+          });
+          await waitForTerminalJobs(store, 1);
+          expect(await store.getRouterBinding("github-pr-mine", "github:pull_request:trmd/pollinate#7")).toBeNull();
+
+          await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-github-event": "pull_request" },
+            body: JSON.stringify({
+              action: "opened",
+              repository: { full_name: "trmd/pollinate" },
+              sender: { login: "trmdy" },
+              pull_request: { number: 8, html_url: "https://github.com/trmd/pollinate/pull/8", title: "Mine", state: "open", user: { login: "trmdy" } },
+            }),
+          });
+          await waitForTerminalJobs(store, 2);
+          const binding = await store.getRouterBinding("github-pr-mine", "github:pull_request:trmd/pollinate#8");
+          expect(binding).toMatchObject({ status: "active", target: { handle: "pr-8" } });
+
+          const log = await hive.log();
+          expect(log).not.toContain("pr-7");
+        } finally {
+          await server.stop();
+          await delivery.shutdown();
+        }
+      } finally {
+        hive.restore();
       }
     });
   });
 
   test("sequence router actions store and address named swarm targets", async () => {
     await withTempStore(async (store, root) => {
-      const bin = join(root, "bin");
-      await mkdir(bin, { recursive: true });
-      const hiveLog = join(root, "hive.log");
-      await writeFile(
-        join(bin, "hive"),
-        `#!/bin/sh
-echo "$@" >> "${hiveLog}"
-if [ "$1" = "spawn" ]; then
-  name="spawned"
-  while [ "$#" -gt 0 ]; do
-    if [ "$1" = "--name" ]; then
-      shift
-      name="$1"
-    fi
-    shift
-  done
-  printf '%s\\tcodex\\t/tmp\\tlocal\\n' "$name"
-fi
-cat >/dev/null
-`,
-      );
-      await chmod(join(bin, "hive"), 0o700);
-      const previousPath = process.env.PATH;
-      process.env.PATH = `${bin}:${previousPath ?? ""}`;
+      const hive = await installHiveStub(root);
       try {
         const trig = trigger({
           id: "github-pr-swarm",
@@ -408,7 +419,7 @@ cat >/dev/null
 
           binding = await store.getRouterBinding("github-pr-swarm", "github:pull_request:trmd/pollinate#456");
           expect(binding?.status).toBe("closed");
-          const log = await readFile(hiveLog, "utf8");
+          const log = await hive.log();
           expect(log).toContain("spawn claude --name claude-456");
           expect(log).toContain("spawn grok --name grok-456");
           expect(log).toContain("send claude-456");
@@ -420,8 +431,87 @@ cat >/dev/null
           await delivery.shutdown();
         }
       } finally {
-        if (previousPath === undefined) delete process.env.PATH;
-        else process.env.PATH = previousPath;
+        hive.restore();
+      }
+    });
+  });
+
+  test("activity delivery failures record the error on the binding", async () => {
+    await withTempStore(async (store, root) => {
+      const hiveLog = join(root, "hive.log");
+      const hive = await installHiveStub(root, {
+        script: `#!/bin/sh
+echo "$@" >> "${hiveLog}"
+if [ "$1" = "spawn" ]; then
+  printf 'pr-77\\tcodex\\t/tmp\\tlocal\\n'
+fi
+if [ "$1" = "send" ]; then
+  echo "session gone" >&2
+  cat >/dev/null
+  exit 1
+fi
+cat >/dev/null
+`,
+      });
+      try {
+        const trig = trigger({
+          id: "github-pr-err",
+          source: { kind: "webhook", webhook: { path: "github/pr-err" } },
+          action: undefined,
+          router: {
+            plugin: "github-pr",
+            openOn: ["github.pull_request.opened"],
+            closeOn: ["github.pull_request.merged"],
+            onOpen: { kind: "honeybee", run: "spawn", bee: "codex", name: "pr-{{pr_number}}" },
+            onActivity: { kind: "honeybee", run: "send", target: "{{binding.target}}", message: "{{activity_markdown}}" },
+          },
+        });
+        await store.saveTrigger(trig);
+        const delivery = new DeliveryManager(store, new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 }));
+        await delivery.init([trig]);
+        const server = new WebhookServer(store, delivery, [trig], "127.0.0.1", 0);
+        await server.start();
+        try {
+          const address = server.address();
+          if (!address) throw new Error("server did not bind");
+          const url = `http://127.0.0.1:${address.port}/hook/github/pr-err`;
+
+          await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-github-event": "pull_request" },
+            body: JSON.stringify({
+              action: "opened",
+              repository: { full_name: "trmd/pollinate" },
+              sender: { login: "alice" },
+              pull_request: { number: 77, html_url: "https://github.com/trmd/pollinate/pull/77", title: "Errs", state: "open" },
+            }),
+          });
+          await waitForTerminalJobs(store, 1);
+
+          await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-github-event": "issue_comment" },
+            body: JSON.stringify({
+              action: "created",
+              repository: { full_name: "trmd/pollinate" },
+              sender: { login: "bob" },
+              issue: { number: 77, title: "Errs", pull_request: { html_url: "https://github.com/trmd/pollinate/pull/77" } },
+              comment: { body: "ping", html_url: "https://github.com/trmd/pollinate/pull/77#issuecomment-1" },
+            }),
+          });
+          await waitForTerminalJobs(store, 2);
+
+          const binding = await store.getRouterBinding("github-pr-err", "github:pull_request:trmd/pollinate#77");
+          expect(binding?.status).toBe("active");
+          expect(binding?.error).toContain("hive send exited 1");
+          const ledger = (await store.readLedger()).join("\n");
+          expect(ledger).toContain("pollinate.router.activity_errored");
+        } finally {
+          await server.stop();
+          await delivery.shutdown();
+        }
+      } finally {
+        hive.restore();
       }
     });
   });

@@ -29,7 +29,7 @@ type AnyRecord = Record<string, unknown>;
 
 export const DEFAULT_DAEMON_CONFIG: DaemonConfig = {
   webhook: { bind: "127.0.0.1", port: 3978, relay: { maxAgeSeconds: 300 } },
-  defaults: { contextTimeout: "5s", commandTimeout: "10m", tickMs: 1_000, triggerReloadMs: 1_000 },
+  defaults: { contextTimeout: "5s", commandTimeout: "10m", tickMs: 1_000, triggerReloadMs: 1_000, bindingGcMs: 60_000 },
   execution: {
     shell: "/bin/sh",
     shellArgs: ["-c"],
@@ -67,6 +67,7 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
       commandTimeout: stringOr(defaults.commandTimeout ?? defaults.command_timeout, DEFAULT_DAEMON_CONFIG.defaults.commandTimeout),
       tickMs: numberOr(defaults.tickMs ?? defaults.tick_ms, DEFAULT_DAEMON_CONFIG.defaults.tickMs),
       triggerReloadMs: numberOr(defaults.triggerReloadMs ?? defaults.trigger_reload_ms, DEFAULT_DAEMON_CONFIG.defaults.triggerReloadMs),
+      bindingGcMs: numberOr(defaults.bindingGcMs ?? defaults.binding_gc_ms, DEFAULT_DAEMON_CONFIG.defaults.bindingGcMs),
     },
     execution: normalizeExecution(execution),
   };
@@ -306,6 +307,7 @@ function normalizeRouter(raw: AnyRecord | undefined): RouterConfig | undefined {
     plugin,
     openOn,
     closeOn,
+    openWhen: normalizeFilter(asOptionalRecord(raw.openWhen ?? raw.open_when)),
     idleTtl: optionalString(raw.idleTtl ?? raw.idle_ttl),
     onOpen,
     onActivity,

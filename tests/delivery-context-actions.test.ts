@@ -3,7 +3,7 @@ import { chmod, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { ActionExecutor, DeliveryManager, resolveContext } from "../src/index.js";
-import { trigger, waitForJobs, waitForTerminalJobs, withTempStore } from "./helpers.js";
+import { installCommandStub, installHiveStub, trigger, waitForJobs, waitForTerminalJobs, withTempStore } from "./helpers.js";
 
 describe("delivery manager", () => {
   test("filters block nonmatching activations and allow equality/existence matches", async () => {
@@ -375,16 +375,10 @@ describe("context and actions", () => {
 
   test("honeybee and hermes actions invoke their CLIs without in-process execution", async () => {
     await withTempStore(async (store, root) => {
-      const bin = join(root, "bin");
-      await mkdir(bin, { recursive: true });
-      const hiveLog = join(root, "hive.log");
+      const hive = await installHiveStub(root);
+      const hiveLog = hive.logPath;
       const hermesLog = join(root, "hermes.log");
-      await writeFile(join(bin, "hive"), `#!/bin/sh\necho "$@" >> "${hiveLog}"\ncat >/dev/null\n`);
-      await writeFile(join(bin, "hermes"), `#!/bin/sh\necho "$@" >> "${hermesLog}"\ncat >/dev/null\n`);
-      await chmod(join(bin, "hive"), 0o700);
-      await chmod(join(bin, "hermes"), 0o700);
-      const previousPath = process.env.PATH;
-      process.env.PATH = `${bin}:${previousPath ?? ""}`;
+      await installCommandStub(root, "hermes", `#!/bin/sh\necho "$@" >> "${hermesLog}"\ncat >/dev/null\n`, hermesLog);
       try {
         const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
         const flow = trigger({
@@ -419,8 +413,7 @@ describe("context and actions", () => {
         expect((await executor.executeJob(hermesJob, hermes, hermesActivation, [{}])).status).toBe("completed");
         expect(await readFile(hermesLog, "utf8")).toContain("respond");
       } finally {
-        if (previousPath === undefined) delete process.env.PATH;
-        else process.env.PATH = previousPath;
+        hive.restore();
       }
     });
   });

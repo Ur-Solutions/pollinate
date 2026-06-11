@@ -1,7 +1,13 @@
 import { readdir, stat } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { githubPrRouterPlugin, type RouterPlugin, type RouterPluginInput } from "./github-pr.js";
+import {
+  githubPrRouterPlugin,
+  type RouterPlugin,
+  type RouterPluginInput,
+  type RouterSubjectState,
+  type RouterSubjectStateOptions,
+} from "./github-pr.js";
 import { pathExists, routerPluginsDir, storeRoot } from "../fsx.js";
 
 export { githubPrRouterPlugin };
@@ -90,4 +96,4 @@ function validateRouterPlugin(value: unknown, requestedName: string): RouterPlug
   return plugin as RouterPlugin;
 }
 
-export type { RouterPlugin, RouterPluginInput };
+export type { RouterPlugin, RouterPluginInput, RouterSubjectState, RouterSubjectStateOptions };

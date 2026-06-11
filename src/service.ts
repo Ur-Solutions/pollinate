@@ -81,16 +81,26 @@ export async function daemonStatus(): Promise<string> {
 }
 
 export async function daemonLogs(lines = 100): Promise<string> {
+  const root = process.env.POLLINATE_STORE_ROOT || join(homedir(), ".pollinate");
+  // The daemon writes its own log; the launchd/systemd stdout/stderr captures
+  // only cover process-level output such as crashes.
+  const daemonLog = (await readFile(join(root, "daemon.log"), "utf8").catch(() => ""))
+    .split(/\n/)
+    .filter(Boolean)
+    .slice(-lines);
   if (platform() === "darwin") {
-    const out = join(process.env.POLLINATE_STORE_ROOT || join(homedir(), ".pollinate"), "daemon.out.log");
-    const err = join(process.env.POLLINATE_STORE_ROOT || join(homedir(), ".pollinate"), "daemon.err.log");
     const [stdout, stderr] = await Promise.all([
-      readFile(out, "utf8").catch(() => ""),
-      readFile(err, "utf8").catch(() => ""),
+      readFile(join(root, "daemon.out.log"), "utf8").catch(() => ""),
+      readFile(join(root, "daemon.err.log"), "utf8").catch(() => ""),
     ]);
-    return [...stdout.split(/\n/), ...stderr.split(/\n/)].filter(Boolean).slice(-lines).join("\n");
+    const captured = [...stdout.split(/\n/), ...stderr.split(/\n/)].filter(Boolean).slice(-lines);
+    if (!daemonLog.length && !captured.length) return "No daemon log output yet. Is the daemon installed and running? (pol daemon status)";
+    if (!captured.length) return daemonLog.join("\n");
+    if (!daemonLog.length) return captured.join("\n");
+    return [...daemonLog, "--- process stdout/stderr ---", ...captured].join("\n");
   }
   if (platform() === "linux") {
+    if (daemonLog.length) return daemonLog.join("\n");
     const result = await execShell(`journalctl --user -u pollinated.service -n ${lines} --no-pager`);
     return result.stdout || result.stderr;
   }

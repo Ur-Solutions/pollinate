@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { ExecutionProfile } from "./types.js";
 
 export type ExecResult = {
@@ -9,19 +9,39 @@ export type ExecResult = {
   timedOut: boolean;
 };
 
-export function execShell(command: string, options: { cwd?: string; timeoutMs?: number; input?: string; execution?: ExecutionProfile } = {}): Promise<ExecResult> {
+export type ExecOptions = { cwd?: string; timeoutMs?: number; input?: string; execution?: ExecutionProfile };
+
+export function execShell(command: string, options: ExecOptions = {}): Promise<ExecResult> {
+  const child = options.execution
+    ? spawn(options.execution.shell, [...options.execution.shellArgs, command], {
+        cwd: options.cwd,
+        env: executionEnv(options.execution),
+        stdio: ["pipe", "pipe", "pipe"],
+      })
+    : spawn(command, {
+        cwd: options.cwd,
+        shell: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+  return collectChild(child, options);
+}
+
+/**
+ * Executes a binary with an argv array and no shell, so argument values
+ * (webhook payloads, comment bodies, templated strings) can never be
+ * interpreted as shell syntax.
+ */
+export function execArgv(file: string, args: string[], options: ExecOptions = {}): Promise<ExecResult> {
+  const child = spawn(file, args, {
+    cwd: options.cwd,
+    env: options.execution ? executionEnv(options.execution) : undefined,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  return collectChild(child, options);
+}
+
+function collectChild(child: ChildProcessWithoutNullStreams, options: ExecOptions): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
-    const child = options.execution
-      ? spawn(options.execution.shell, [...options.execution.shellArgs, command], {
-          cwd: options.cwd,
-          env: executionEnv(options.execution),
-          stdio: ["pipe", "pipe", "pipe"],
-        })
-      : spawn(command, {
-          cwd: options.cwd,
-          shell: true,
-          stdio: ["pipe", "pipe", "pipe"],
-        });
     let stdout = "";
     let stderr = "";
     let timedOut = false;

@@ -1,5 +1,6 @@
 import { renderAction } from "./templates.js";
 import type { ActionResult } from "./actions.js";
+import { matchesFilter } from "./filter.js";
 import { getRouterPlugin } from "./router-plugins/index.js";
 import type { Activation, Action, CanonicalRouterEvent, JsonValue, RouterBinding, RouterConfig, Trigger } from "./types.js";
 import type { PollinateStore } from "./store.js";
@@ -9,12 +10,15 @@ export type RouterActionExecutor = {
   executeAction(action: Action, cwd?: string): Promise<ActionResult>;
 };
 
-export type ExecuteRouterOptions = {
+export type RouterDeps = {
   store: PollinateStore;
   executor: RouterActionExecutor;
   trigger: Trigger;
-  activation: Activation;
   cwd?: string;
+};
+
+export type ExecuteRouterOptions = RouterDeps & {
+  activation: Activation;
 };
 
 export type RouterEventResult =
@@ -51,6 +55,16 @@ async function handleRouterEvent(
   return options.store.withRouterBindingLock(options.trigger.id, event.subjectKey, async () => {
     const current = await options.store.getRouterBinding(options.trigger.id, event.subjectKey);
     if (router.openOn.includes(event.kind)) {
+      if (!matchesFilter(router.openWhen, event.payload)) {
+        await options.store.appendLedger({
+          event: "pollinate.router.open_filtered",
+          trigger_id: options.trigger.id,
+          router: router.plugin,
+          subject_key: event.subjectKey,
+          event_kind: event.kind,
+        });
+        return { subjectKey: event.subjectKey, kind: event.kind, outcome: "dropped", reason: "openWhen filter" };
+      }
       if (current?.target && current.status !== "closed" && current.status !== "errored") {
         await options.store.appendLedger({
           event: "pollinate.router.already_bound",
@@ -81,8 +95,8 @@ async function handleRouterEvent(
   });
 }
 
-async function createBinding(
-  options: ExecuteRouterOptions,
+export async function createBinding(
+  deps: RouterDeps,
   router: RouterConfig,
   event: CanonicalRouterEvent,
   existing: RouterBinding | null,
@@ -91,18 +105,18 @@ async function createBinding(
   const pending: RouterBinding = existing
     ? { ...existing, status: "pending", target: undefined, error: undefined, updatedAt: now }
     : {
-        id: bindingId(options.trigger.id, event.subjectKey),
-        triggerId: options.trigger.id,
+        id: bindingId(deps.trigger.id, event.subjectKey),
+        triggerId: deps.trigger.id,
         router: router.plugin,
         subjectKey: event.subjectKey,
         status: "pending",
         createdAt: now,
         updatedAt: now,
       };
-  await options.store.saveRouterBinding({ ...pending, status: "pending", updatedAt: now, lastEventKind: event.kind });
-  await options.store.appendLedger({
+  await deps.store.saveRouterBinding({ ...pending, status: "pending", updatedAt: now, lastEventKind: event.kind, context: event.payload });
+  await deps.store.appendLedger({
     event: "pollinate.router.binding_pending",
-    trigger_id: options.trigger.id,
+    trigger_id: deps.trigger.id,
     router: router.plugin,
     subject_key: event.subjectKey,
     event_kind: event.kind,
@@ -110,7 +124,7 @@ async function createBinding(
 
   try {
     const rendered = renderRouterAction(router.onOpen, event, pending);
-    const result = await options.executor.executeAction(rendered, options.cwd);
+    const result = await deps.executor.executeAction(rendered, deps.cwd);
     const handles = result.handles && isStringRecord(result.handles) ? result.handles : undefined;
     const handle = typeof result.handle === "string" ? result.handle : handles ? Object.values(handles)[0] : honeybeeSpawnName(rendered);
     if (!handle) throw new Error("Router onOpen action did not produce a target handle");
@@ -122,11 +136,13 @@ async function createBinding(
       lastActivityAt: nowIso(),
       lastEventKind: event.kind,
       error: undefined,
+      context: event.payload,
+      openAttempts: undefined,
     };
-    await options.store.saveRouterBinding(active);
-    await options.store.appendLedger({
+    await deps.store.saveRouterBinding(active);
+    await deps.store.appendLedger({
       event: "pollinate.router.binding_created",
-      trigger_id: options.trigger.id,
+      trigger_id: deps.trigger.id,
       router: router.plugin,
       subject_key: event.subjectKey,
       event_kind: event.kind,
@@ -135,16 +151,18 @@ async function createBinding(
     return { subjectKey: event.subjectKey, kind: event.kind, outcome: "created", target: handle };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await options.store.saveRouterBinding({
+    await deps.store.saveRouterBinding({
       ...pending,
       status: "errored",
       updatedAt: nowIso(),
       lastEventKind: event.kind,
       error: message,
+      context: event.payload,
+      openAttempts: (pending.openAttempts ?? 0) + 1,
     });
-    await options.store.appendLedger({
+    await deps.store.appendLedger({
       event: "pollinate.router.binding_errored",
-      trigger_id: options.trigger.id,
+      trigger_id: deps.trigger.id,
       router: router.plugin,
       subject_key: event.subjectKey,
       event_kind: event.kind,
@@ -155,18 +173,40 @@ async function createBinding(
 }
 
 async function routeToBinding(
-  options: ExecuteRouterOptions,
+  deps: RouterDeps,
   router: RouterConfig,
   event: CanonicalRouterEvent,
   binding: RouterBinding,
 ): Promise<RouterEventResult> {
   const action = renderRouterAction(router.onActivity, event, binding);
-  await options.executor.executeAction(action, options.cwd);
-  const updated = { ...binding, status: "active" as const, updatedAt: nowIso(), lastActivityAt: nowIso(), lastEventKind: event.kind };
-  await options.store.saveRouterBinding(updated);
-  await options.store.appendLedger({
+  try {
+    await deps.executor.executeAction(action, deps.cwd);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await deps.store.saveRouterBinding({ ...binding, updatedAt: nowIso(), lastEventKind: event.kind, error: message });
+    await deps.store.appendLedger({
+      event: "pollinate.router.activity_errored",
+      trigger_id: deps.trigger.id,
+      router: router.plugin,
+      subject_key: event.subjectKey,
+      event_kind: event.kind,
+      target: binding.target?.handle,
+      error: message,
+    });
+    throw error;
+  }
+  const updated = {
+    ...binding,
+    status: "active" as const,
+    updatedAt: nowIso(),
+    lastActivityAt: nowIso(),
+    lastEventKind: event.kind,
+    error: undefined,
+  };
+  await deps.store.saveRouterBinding(updated);
+  await deps.store.appendLedger({
     event: "pollinate.router.binding_routed",
-    trigger_id: options.trigger.id,
+    trigger_id: deps.trigger.id,
     router: router.plugin,
     subject_key: event.subjectKey,
     event_kind: event.kind,
@@ -175,21 +215,21 @@ async function routeToBinding(
   return { subjectKey: event.subjectKey, kind: event.kind, outcome: "routed", target: binding.target!.handle };
 }
 
-async function closeBinding(
-  options: ExecuteRouterOptions,
+export async function closeBinding(
+  deps: RouterDeps,
   router: RouterConfig,
   event: CanonicalRouterEvent,
   binding: RouterBinding,
 ): Promise<RouterEventResult> {
   const closing = { ...binding, status: "closing" as const, updatedAt: nowIso(), lastEventKind: event.kind };
-  await options.store.saveRouterBinding(closing);
+  await deps.store.saveRouterBinding(closing);
   const action = renderRouterAction(router.onClose ?? defaultCloseAction(), event, closing);
-  await options.executor.executeAction(action, options.cwd);
+  await deps.executor.executeAction(action, deps.cwd);
   const closed = { ...closing, status: "closed" as const, updatedAt: nowIso(), lastActivityAt: nowIso() };
-  await options.store.saveRouterBinding(closed);
-  await options.store.appendLedger({
+  await deps.store.saveRouterBinding(closed);
+  await deps.store.appendLedger({
     event: "pollinate.router.binding_closed",
-    trigger_id: options.trigger.id,
+    trigger_id: deps.trigger.id,
     router: router.plugin,
     subject_key: event.subjectKey,
     event_kind: event.kind,

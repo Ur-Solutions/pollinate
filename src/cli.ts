@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { PollinateStore } from "./store.js";
 import { ActionExecutor } from "./actions.js";
 import { parseDuration, sleep, nowIso } from "./time.js";
-import { slugify } from "./config.js";
+import { parseTriggerToml, slugify } from "./config.js";
 import { applyWebhookTransform } from "./webhook.js";
 import { runForeground } from "./daemon.js";
 import { SatelliteServer } from "./satellite.js";
@@ -228,6 +228,15 @@ async function cmdEdit(store: PollinateStore, args: ParsedArgs): Promise<void> {
     child.on("error", reject);
     child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`${editor} exited ${code}`))));
   });
+  const text = await readFile(store.triggerPath(id), "utf8");
+  let edited: Trigger;
+  try {
+    edited = parseTriggerToml(text, id);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Trigger "${id}" failed validation after edit: ${message}\n  The file was saved as-is and the daemon will not load it. Run pol edit ${id} to fix it.`);
+  }
+  print(args, edited, `${say.ok(`validated ${c.bold(edited.id)}`)}  ${c.dim(triggerSummary(edited))}`);
 }
 
 async function cmdTrigger(store: PollinateStore, args: ParsedArgs): Promise<void> {
@@ -1045,7 +1054,6 @@ function renderTrigger(trigger: Trigger): string {
     ["delivery", describeDelivery(trigger.delivery)],
     trigger.filter ? ["filter", c.dim(compactJson(trigger.filter))] : null,
     trigger.context ? ["context", describeContext(contextVars(trigger.context))] : null,
-    trigger.router ? ["router", describeRouter(trigger.router)] : null,
     trigger.action ? ["action", describeAction(trigger.action)] : null,
   ];
   const lines = [headline, subtitle, "", fields(pairs)];
@@ -1053,6 +1061,11 @@ function renderTrigger(trigger: Trigger): string {
   if (detail) {
     const labelWidth = Math.max(...(pairs.filter(Boolean) as [string, string][]).map(([l]) => l.length));
     lines.push(field("", c.dim(detail), labelWidth));
+  }
+  if (trigger.router) {
+    lines.push("");
+    lines.push(c.dim("router"));
+    lines.push(renderRouterDetail(trigger.router));
   }
   lines.push("");
   lines.push(c.dim(`created ${relativeTime(trigger.createdAt)} ${sym.mid} updated ${relativeTime(trigger.updatedAt)}`));
@@ -1127,8 +1140,55 @@ function describeAction(action: Action): string {
   }
 }
 
-function describeRouter(router: NonNullable<Trigger["router"]>): string {
-  return `${c.bold(router.plugin)} ${c.dim(`${sym.mid} open ${router.openOn.length} close ${router.closeOn.length}`)}`;
+function renderRouterDetail(router: RouterConfig): string {
+  const rows: Array<[string, string]> = [
+    ["plugin", c.bold(router.plugin)],
+    ["openOn", router.openOn.join(", ")],
+    ["closeOn", router.closeOn.join(", ")],
+  ];
+  if (router.openWhen) rows.push(["openWhen", compactJson(router.openWhen)]);
+  if (router.idleTtl) rows.push(["idleTtl", router.idleTtl]);
+  rows.push(["onOpen", routerActionSummary(router.onOpen)]);
+  rows.push(["onActivity", routerActionSummary(router.onActivity)]);
+  rows.push(["onClose", router.onClose ? routerActionSummary(router.onClose) : c.dim("default · honeybee kill {{binding.target}}")]);
+  const labelWidth = Math.max(...rows.map(([label]) => label.length));
+  const lines: string[] = [];
+  for (const [label, value] of rows) {
+    const [first = "", ...rest] = value.split("\n");
+    lines.push(field(label, first, labelWidth));
+    for (const continuation of rest) lines.push(field("", continuation, labelWidth));
+  }
+  return lines.join("\n");
+}
+
+function routerActionSummary(action: Action): string {
+  const max = Math.max(20, (process.stdout.columns || 80) - 28);
+  if (action.kind === "honeybee") {
+    const parts: string[] = [`${c.bold("honeybee")} ${action.run}`];
+    if (action.run === "spawn") {
+      parts.push(`bee=${action.bee}`);
+      if (action.name) parts.push(`name=${action.name}`);
+      if (action.args?.length) parts.push(c.dim(`args=${truncate(action.args.join(" "), max)}`));
+    }
+    if (action.run === "send" || action.run === "buz" || action.run === "kill") parts.push(`target=${action.target}`);
+    if (action.run === "buz" && action.tier) parts.push(`tier=${action.tier}`);
+    if (action.run === "flow") parts.push(`flow=${action.flow}`);
+    const lines = [parts.join(c.dim(` ${sym.mid} `))];
+    const message = "message" in action ? action.message : undefined;
+    if (message) lines.push(c.dim(`message: ${truncate(message.replace(/\s+/g, " "), max)}`));
+    return lines.join("\n");
+  }
+  if (action.kind === "sequence") {
+    const lines = [describeAction(action)];
+    for (const step of action.actions) {
+      const sub = routerActionSummary(step.action).split("\n");
+      lines.push(`${c.dim(`${step.id ?? step.action.kind}:`)} ${sub[0] ?? ""}`);
+      for (const extra of sub.slice(1)) lines.push(`  ${extra}`);
+    }
+    return lines.join("\n");
+  }
+  const detail = actionDetail(action);
+  return detail ? `${describeAction(action)}\n${c.dim(truncate(detail.replace(/\s+/g, " "), max))}` : describeAction(action);
 }
 
 function actionDetail(action: Action): string | undefined {

@@ -104,6 +104,7 @@ export type RouterConfig = {
   plugin: string;
   openOn: string[];
   closeOn: string[];
+  openWhen?: Filter;
   idleTtl?: string;
   onOpen: Action;
   onActivity: Action;
@@ -201,6 +202,12 @@ export type RouterBinding = {
   lastActivityAt?: string;
   lastEventKind?: string;
   error?: string;
+  /** Payload of the event that opened (or last tried to open) the binding; lets the GC re-render onOpen/onClose. */
+  context?: JsonObject;
+  /** Failed onOpen attempts since the binding last went active; bounds GC retries. */
+  openAttempts?: number;
+  /** Last time the GC reconciled this binding against the live subject state. */
+  checkedAt?: string;
 };
 
 export type ScheduleState = Record<
@@ -249,6 +256,7 @@ export type DaemonConfig = {
     commandTimeout: string;
     tickMs: number;
     triggerReloadMs: number;
+    bindingGcMs: number;
   };
   execution: ExecutionProfile;
 };

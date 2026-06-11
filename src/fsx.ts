@@ -31,6 +31,10 @@ export function ledgerPath(root = storeRoot()): string {
   return join(root, "ledger.jsonl");
 }
 
+export function daemonLogPath(root = storeRoot()): string {
+  return join(root, "daemon.log");
+}
+
 export function daemonConfigPath(root = storeRoot()): string {
   return join(root, "pollinate.toml");
 }
@@ -72,10 +76,14 @@ export async function writeJson(path: string, value: unknown): Promise<void> {
 }
 
 export async function appendJsonLine(path: string, value: unknown): Promise<void> {
+  await appendTextLine(path, JSON.stringify(value));
+}
+
+export async function appendTextLine(path: string, line: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const handle = await open(path, "a", 0o600);
   try {
-    await handle.appendFile(`${JSON.stringify(value)}\n`, "utf8");
+    await handle.appendFile(`${line}\n`, "utf8");
   } finally {
     await handle.close();
   }

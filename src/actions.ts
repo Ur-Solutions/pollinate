@@ -2,7 +2,7 @@ import type { Action, Activation, DryRunResult, ExecutionProfile, Job, JsonValue
 import { PollinateStore } from "./store.js";
 import { resolveContext } from "./context.js";
 import { renderAction, renderString } from "./templates.js";
-import { execShell, shellQuote } from "./process.js";
+import { execArgv, execShell, type ExecResult } from "./process.js";
 import { nowIso, parseDuration } from "./time.js";
 import { executeRouter } from "./router.js";
 
@@ -253,26 +253,11 @@ export class ActionExecutor {
   private executeHoneybee(action: Extract<Action, { kind: "honeybee" }>, cwd?: string): Promise<ActionResult> {
     if (action.run === "flow") {
       const args = Object.entries(action.args ?? {}).flatMap(([key, value]) => ["--arg", `${key}=${value}`]);
-      return execShell(["hive", "flow", "run", shellQuote(action.flow), ...args.map(shellQuote)].join(" "), {
-        cwd,
-        timeoutMs: this.options.commandTimeoutMs,
-        execution: this.options.execution,
-      }).then((result) => {
-        if (result.exitCode !== 0) throw new Error(`hive flow run exited ${result.exitCode}: ${result.stderr.trim()}`);
-        return { ...result };
-      });
+      return this.execHive(["flow", "run", action.flow, ...args], "hive flow run", { cwd });
     }
     if (action.run === "loop") {
       const loop = cwd && !Object.prototype.hasOwnProperty.call(action.loop, "cwd") ? { ...action.loop, cwd } : action.loop;
-      const flags = flagsFromRecord(loop);
-      return execShell(["hive", "loop", "start", ...flags.map(shellQuote)].join(" "), {
-        cwd,
-        timeoutMs: this.options.commandTimeoutMs,
-        execution: this.options.execution,
-      }).then((result) => {
-        if (result.exitCode !== 0) throw new Error(`hive loop start exited ${result.exitCode}: ${result.stderr.trim()}`);
-        return { ...result };
-      });
+      return this.execHive(["loop", "start", ...flagsFromRecord(loop)], "hive loop start", { cwd });
     }
     if (action.run === "spawn") {
       const spawnCwd = action.cwd ?? cwd;
@@ -287,21 +272,13 @@ export class ActionExecutor {
       if (action.acceptTrust === false) flags.push("--no-accept-trust");
       const beeArgs = action.args?.length ? ["--", ...action.args] : [];
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-      return execShell(["hive", "spawn", shellQuote(action.bee), ...flags.map(shellQuote), ...beeArgs.map(shellQuote)].join(" "), {
-        cwd: spawnCwd,
-        timeoutMs,
-        execution: this.options.execution,
-      }).then(async (result) => {
-        if (result.exitCode !== 0) throw new Error(`hive spawn exited ${result.exitCode}: ${result.stderr.trim()}`);
-        const handle = parseHiveHandle(result.stdout) ?? action.name;
-        if (!handle) throw new Error("hive spawn did not return a target handle");
+      return this.execHive(["spawn", action.bee, ...flags, ...beeArgs], "hive spawn", { cwd: spawnCwd, timeoutMs }).then(async (result) => {
+        const handle = parseHiveHandle(result.stdout) ?? (isValidHiveHandle(action.name) ? action.name : undefined);
+        if (!handle) {
+          throw new Error(`hive spawn did not return a parsable target handle; stdout: ${JSON.stringify(String(result.stdout).slice(0, 200))}`);
+        }
         if (action.message) {
-          const sent = await execShell(["hive", "send", shellQuote(handle), shellQuote(action.message)].join(" "), {
-            cwd: spawnCwd,
-            timeoutMs,
-            execution: this.options.execution,
-          });
-          if (sent.exitCode !== 0) throw new Error(`hive send exited ${sent.exitCode}: ${sent.stderr.trim()}`);
+          const sent = await this.execHive(["send", handle, action.message], "hive send", { cwd: spawnCwd, timeoutMs });
           return { ...result, handle, sent };
         }
         return { ...result, handle };
@@ -309,44 +286,40 @@ export class ActionExecutor {
     }
     if (action.run === "send") {
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-      return execShell(["hive", "send", shellQuote(action.target), shellQuote(action.message)].join(" "), {
-        cwd,
-        timeoutMs,
-        execution: this.options.execution,
-      }).then((result) => {
-        if (result.exitCode !== 0) throw new Error(`hive send exited ${result.exitCode}: ${result.stderr.trim()}`);
-        return { ...result };
-      });
+      return this.execHive(["send", action.target, action.message], "hive send", { cwd, timeoutMs });
     }
     if (action.run === "buz") {
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-      const command = [
-        "hive",
+      const args = [
         "buz",
         "send",
-        shellQuote(action.target),
+        action.target,
         "--sender-human",
-        shellQuote(action.senderHuman ?? "pollinate"),
+        action.senderHuman ?? "pollinate",
         "--tier",
-        shellQuote(action.tier ?? "queue"),
-        ...(action.subject ? ["--subject", shellQuote(action.subject)] : []),
+        action.tier ?? "queue",
+        ...(action.subject ? ["--subject", action.subject] : []),
         "-p",
-        shellQuote(action.message),
-      ].join(" ");
-      return execShell(command, { cwd, timeoutMs, execution: this.options.execution }).then((result) => {
-        if (result.exitCode !== 0) throw new Error(`hive buz send exited ${result.exitCode}: ${result.stderr.trim()}`);
-        return { ...result };
-      });
+        action.message,
+      ];
+      return this.execHive(args, "hive buz send", { cwd, timeoutMs });
     }
     if (action.run === "kill") {
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-      return execShell(["hive", "kill", shellQuote(action.target)].join(" "), { cwd, timeoutMs, execution: this.options.execution }).then((result) => {
-        if (result.exitCode !== 0) throw new Error(`hive kill exited ${result.exitCode}: ${result.stderr.trim()}`);
-        return { ...result };
-      });
+      return this.execHive(["kill", action.target], "hive kill", { cwd, timeoutMs });
     }
     const neverAction: never = action;
     throw new Error(`Unsupported honeybee action: ${JSON.stringify(neverAction)}`);
+  }
+
+  private async execHive(args: string[], label: string, options: { cwd?: string; timeoutMs?: number }): Promise<ActionResult & ExecResult> {
+    const result = await execArgv("hive", args, {
+      cwd: options.cwd,
+      timeoutMs: options.timeoutMs ?? this.options.commandTimeoutMs,
+      execution: this.options.execution,
+    });
+    if (result.exitCode !== 0) throw new Error(`${label} exited ${result.exitCode}: ${result.stderr.trim()}`);
+    return { ...result };
   }
 
   private executeHermes(action: Extract<Action, { kind: "hermes" }>, cwd?: string): Promise<ActionResult> {
@@ -361,7 +334,7 @@ export class ActionExecutor {
       }, cwd);
     }
     const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-    return execShell(["hermes", shellQuote(action.invoke)].join(" "), { cwd, input: action.payload, timeoutMs, execution: this.options.execution }).then((result) => {
+    return execArgv("hermes", [action.invoke], { cwd, input: action.payload, timeoutMs, execution: this.options.execution }).then((result) => {
       if (result.exitCode !== 0) throw new Error(`hermes exited ${result.exitCode}: ${result.stderr.trim()}`);
       return { ...result };
     });
@@ -383,10 +356,19 @@ function flagsFromRecord(record: Record<string, JsonValue | undefined>): string[
   });
 }
 
-function parseHiveHandle(stdout: string): string | undefined {
-  const line = stdout.split(/\r?\n/).map((item) => item.trim()).find(Boolean);
-  if (!line) return undefined;
-  return line.split(/\s+/)[0];
+const HIVE_HANDLE_RE = /^[A-Za-z0-9._:-]+$/;
+
+export function isValidHiveHandle(value: string | undefined): value is string {
+  // The trailing-colon exclusion skips prefix lines like "warning:" or "Error:".
+  return Boolean(value && HIVE_HANDLE_RE.test(value) && !value.endsWith(":"));
+}
+
+export function parseHiveHandle(stdout: string): string | undefined {
+  for (const line of stdout.split(/\r?\n/)) {
+    const token = line.trim().split(/\s+/)[0];
+    if (isValidHiveHandle(token)) return token;
+  }
+  return undefined;
 }
 
 export function sourceKindForTrigger(trigger: Trigger, fallback: SourceKind = "manual"): SourceKind {
