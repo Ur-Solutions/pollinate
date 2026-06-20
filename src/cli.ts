@@ -3,9 +3,12 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { PollinateStore } from "./store.js";
-import { ActionExecutor } from "./actions.js";
+import { ActionExecutor, createExecutor, fireTriggerNow, parseHiveHandle } from "./actions.js";
 import { parseDuration, sleep, nowIso } from "./time.js";
-import { parseTriggerToml, slugify } from "./config.js";
+import { parseTriggerToml, slugify, triggerToToml } from "./config.js";
+import { execArgv } from "./process.js";
+import { isSidebarTab, readSidebarTab, toggleSidebar, writeSidebarTab, type SidebarTab } from "./sidebar.js";
+import { runSidebarTui, type NewTriggerDraft, type SidebarData } from "./sidebarTui.js";
 import { applyWebhookTransform } from "./webhook.js";
 import { runForeground } from "./daemon.js";
 import { SatelliteServer } from "./satellite.js";
@@ -42,7 +45,7 @@ import {
   table,
   truncate,
 } from "./ui.js";
-import type { Action, Activation, ContextResolver, Delivery, Filter, Job, JobStatus, JsonValue, MissedFirePolicy, RouterConfig, Source, SourceKind, Trigger } from "./types.js";
+import type { Action, Activation, ContextResolver, Delivery, Filter, Job, JobStatus, JsonValue, MissedFirePolicy, RouterBinding, RouterConfig, ScheduleTiming, Source, SourceKind, Trigger } from "./types.js";
 
 type ParsedArgs = {
   command?: string;
@@ -92,6 +95,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       return;
     case "jobs":
       await cmdJobs(await getStore(), args);
+      return;
+    case "sidebar":
+      await cmdSidebar(await getStore(), args);
       return;
     case "bindings":
       await cmdBindings(await getStore(), args);
@@ -250,11 +256,8 @@ async function cmdTrigger(store: PollinateStore, args: ParsedArgs): Promise<void
     print(args, dryRun, renderDryRun(trigger, dryRun));
     return;
   }
-  const job = await executor.createQueuedJob(trigger, activation, [payload]);
-  await store.saveJob(job);
-  await store.appendLedger({ event: "pollinate.job.queued", job_id: job.id, trigger_id: trigger.id, queue_position: 0, at: nowIso() });
   const completed = await runWithSpinner(args, `firing ${c.bold(trigger.id)}…`, () =>
-    executor.executeJob(job, trigger, activation, [payload]),
+    fireTriggerNow(store, trigger, payload, { executor }),
   );
   print(args, completed, renderJobOutcome(completed));
 }
@@ -298,6 +301,140 @@ async function cmdJobs(store: PollinateStore, args: ParsedArgs): Promise<void> {
   const last = numberFlag(args, "last");
   const jobs = await store.listJobs({ status, triggerId, last });
   print(args, jobs, renderJobList(jobs));
+}
+
+async function cmdSidebar(store: PollinateStore, args: ParsedArgs): Promise<void> {
+  if (args.flags["toggle-sidebar"]) {
+    const state = await toggleSidebar(numberFlag(args, "width"));
+    print(args, { state }, state === "opened" ? say.ok("sidebar opened") : say.ok("sidebar closed"));
+    return;
+  }
+
+  const loadData = async (): Promise<SidebarData> => {
+    const [triggers, recent, bindings] = await Promise.all([
+      store.loadTriggers(),
+      store.listJobs({ last: 300 }),
+      store.listRouterBindings(),
+    ]);
+    return {
+      triggers,
+      active: recent.filter((job) => !TERMINAL.has(job.status)),
+      history: recent.filter((job) => TERMINAL.has(job.status)).slice(0, 100),
+      bindings,
+    };
+  };
+
+  // Non-interactive (piped / non-tmux without a TTY): print one snapshot, exit.
+  const tabFlag = stringFlag(args, "tab");
+  const initialTab: SidebarTab = isSidebarTab(tabFlag) ? tabFlag : (await readSidebarTab()) ?? "triggers";
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    const data = await loadData();
+    print(args, data, renderSidebarSnapshot(data));
+    return;
+  }
+
+  await runSidebarTui({
+    sidebar: Boolean(args.flags.sidebar),
+    initialTab,
+    loadData,
+    syncTab: () => readSidebarTab(),
+    onTabChange: (tab) => writeSidebarTab(tab),
+    renderTriggerPreview: (trigger) => renderTrigger(trigger),
+    renderJobPreview: (job) => renderJob(job),
+    renderBindingPreview: (binding) => renderBinding(binding),
+    runNow: async (trigger, payloadJson) => {
+      const job = await fireTriggerNow(store, trigger, parsePayload(payloadJson));
+      return `${jobBadge(job.status)} ${shortId(job.id)}`;
+    },
+    toggleEnabled: async (trigger) => {
+      const updated = await store.setTriggerEnabled(trigger.id, !trigger.enabled);
+      return updated.enabled ? `enabled ${updated.id}` : `disabled ${updated.id}`;
+    },
+    cancelJob: async (job) => {
+      const cancelled = await store.cancelJob(job.id);
+      return `${jobBadge(cancelled.status)} ${shortId(cancelled.id)}`;
+    },
+    saveSchedule: async (trigger, timing) => {
+      await store.saveTrigger({ ...trigger, source: { kind: "schedule", timing } });
+      return `updated schedule for ${trigger.id}`;
+    },
+    createTrigger: async (draft) => {
+      const trigger = triggerFromDraft(draft);
+      const created = await store.addTriggerFromToml(triggerToToml(trigger), trigger.id);
+      return `created ${created.id}`;
+    },
+    duplicateJob: async (job, payloadJson) => {
+      const trigger = await store.getTrigger(job.triggerId);
+      if (!trigger) throw new Error(`trigger ${job.triggerId} no longer exists`);
+      const fired = await fireTriggerNow(store, trigger, parsePayload(payloadJson));
+      return `${jobBadge(fired.status)} ${shortId(fired.id)}`;
+    },
+    hiveJump: async (handle) => {
+      const result = await execArgv("hive", ["open", handle], { timeoutMs: 15_000 });
+      if (result.exitCode !== 0) throw new Error(`hive open ${handle}: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
+      return `opened ${handle}`;
+    },
+    spawnHiveAuthor: async (trigger) => {
+      const cwd = trigger?.cwd ?? process.cwd();
+      const prompt = hiveAuthorPrompt(trigger);
+      const result = await execArgv("hive", ["x", "codex", prompt], { cwd, timeoutMs: 30_000 });
+      if (result.exitCode !== 0) throw new Error(`hive x: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
+      const handle = parseHiveHandle(result.stdout);
+      if (handle) await execArgv("hive", ["open", handle], { timeoutMs: 15_000 });
+      return handle ? `authoring with ${handle}` : "spawned hive authoring session";
+    },
+  });
+}
+
+function triggerFromDraft(draft: NewTriggerDraft): Trigger {
+  const id = slugify(draft.name || "trigger");
+  const now = nowIso();
+  let source: Source;
+  if (draft.sourceKind === "schedule") {
+    const t = draft.scheduleType.trim();
+    const v = draft.scheduleValue.trim();
+    const timing: ScheduleTiming =
+      t === "cron" ? { type: "cron", expression: v } : t === "once" ? { type: "once", at: v } : { type: "every", interval: v };
+    source = { kind: "schedule", timing };
+  } else if (draft.sourceKind === "webhook") {
+    source = { kind: "webhook", webhook: { path: draft.webhookPath.trim() || id } };
+  } else {
+    source = { kind: "manual" };
+  }
+  const action: Action =
+    draft.actionKind === "honeybee"
+      ? { kind: "honeybee", run: "spawn", bee: draft.bee.trim() || "codex" }
+      : { kind: "command", command: draft.command.trim() || "true" };
+  return {
+    id,
+    name: draft.name || id,
+    tags: [],
+    enabled: true,
+    source,
+    delivery: { mode: { strategy: "immediate" }, maxConcurrent: 1 },
+    action,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function hiveAuthorPrompt(trigger?: Trigger): string {
+  const base =
+    "Help me author a Pollinate trigger. Pollinate (`pol`) is a trigger substrate; triggers are TOML files created with `pol create`/`pol add`. " +
+    "Read its trigger TOML schema (run `pol --help` and check the project's AGENTS.md), then propose and create a trigger with me.";
+  return trigger ? `${base} Use the existing trigger "${trigger.id}" as a starting point.` : base;
+}
+
+function renderSidebarSnapshot(data: SidebarData): string {
+  return [
+    heading("pollinate sidebar"),
+    "",
+    `${c.bold(String(data.triggers.length))} triggers ${c.dim(sym.mid)} ${c.bold(String(data.active.length))} active ${c.dim(sym.mid)} ${c.bold(String(data.history.length))} in history`,
+    "",
+    data.triggers.length ? renderTriggerList(data.triggers) : c.dim("No triggers yet."),
+    "",
+    c.dim("sidebar TUI needs a TTY — bind cmd+option+B or run `pol sidebar` in a terminal"),
+  ].join("\n");
 }
 
 async function cmdBindings(store: PollinateStore, args: ParsedArgs): Promise<void> {
@@ -1033,12 +1170,7 @@ function ledgerExtras(event: Record<string, unknown>): string {
 }
 
 async function newExecutor(store: PollinateStore): Promise<ActionExecutor> {
-  const config = await store.daemonConfig();
-  return new ActionExecutor(store, {
-    contextTimeoutMs: parseDuration(config.defaults.contextTimeout, 5_000),
-    commandTimeoutMs: parseDuration(config.defaults.commandTimeout, 600_000),
-    execution: config.execution,
-  });
+  return createExecutor(store);
 }
 
 function renderTrigger(trigger: Trigger): string {
@@ -1596,6 +1728,8 @@ function optionalFlagValue(key: string, next: string | undefined, consume: (valu
 function flagValue(key: string, argv: string[], consume: () => string): string | boolean {
   const booleanFlags = new Set([
     "json",
+    "sidebar",
+    "toggle-sidebar",
     "enabled",
     "disabled",
     "dry-run",
@@ -1701,6 +1835,8 @@ async function printHelp(): Promise<void> {
       ["trigger <id> [--dry-run]", "fire now; --payload '{…}' to pass data"],
       ["jobs [--status <s>] [--last n]", "list recent jobs"],
       ["job <jobId> | job cancel <id>", "inspect or cancel a job"],
+      ["sidebar [--tab <t>]", "live TUI: triggers, active jobs, history (cmd+option+B)"],
+      ["sidebar --toggle-sidebar", "open/close the tmux sidebar pane on the right"],
       ["bindings [--trigger <id>]", "list router subject→target bindings"],
       ["bindings get <id>", "inspect a router binding"],
       ["routers [list]", "list built-in and user-space router plugins"],

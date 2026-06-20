@@ -341,6 +341,41 @@ export class ActionExecutor {
   }
 }
 
+/** Build an ActionExecutor from the store's daemon config (timeouts + shell). */
+export async function createExecutor(store: PollinateStore): Promise<ActionExecutor> {
+  const config = await store.daemonConfig();
+  return new ActionExecutor(store, {
+    contextTimeoutMs: parseDuration(config.defaults.contextTimeout, 5_000),
+    commandTimeoutMs: parseDuration(config.defaults.commandTimeout, 600_000),
+    execution: config.execution,
+  });
+}
+
+/**
+ * Fire a trigger immediately with the given payload: queue a job, ledger it, run
+ * it to completion, and return the terminal job. Shared by `pol trigger`, the
+ * sidebar's run-now/duplicate actions, and tests — so the manual-fire path lives
+ * in one place. `executor` may be injected to reuse a configured instance.
+ */
+export async function fireTriggerNow(
+  store: PollinateStore,
+  trigger: Trigger,
+  payload: JsonValue = {},
+  options: { executor?: ActionExecutor; source?: SourceKind } = {},
+): Promise<Job> {
+  const executor = options.executor ?? (await createExecutor(store));
+  const activation: Activation = {
+    triggerId: trigger.id,
+    source: options.source ?? "manual",
+    payload,
+    receivedAt: nowIso(),
+  };
+  const job = await executor.createQueuedJob(trigger, activation, [payload]);
+  await store.saveJob(job);
+  await store.appendLedger({ event: "pollinate.job.queued", job_id: job.id, trigger_id: trigger.id, queue_position: 0, at: nowIso() });
+  return executor.executeJob(job, trigger, activation, [payload]);
+}
+
 async function runSequence<T, R>(items: T[], fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const out: R[] = [];
   for (let index = 0; index < items.length; index += 1) out.push(await fn(items[index]!, index));
