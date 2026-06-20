@@ -90,7 +90,30 @@ async function handleRouterEvent(
       return { subjectKey: event.subjectKey, kind: event.kind, outcome: "dropped", reason: "no binding" };
     }
 
+    if (current.status === "closed") {
+      await options.store.appendLedger({
+        event: "pollinate.router.closed_filtered",
+        trigger_id: options.trigger.id,
+        router: router.plugin,
+        subject_key: event.subjectKey,
+        event_kind: event.kind,
+        target: current.target.handle,
+      });
+      return { subjectKey: event.subjectKey, kind: event.kind, outcome: "dropped", reason: "binding closed" };
+    }
+
     if (router.closeOn.includes(event.kind)) return closeBinding(options, router, event, current);
+    if (!matchesFilter(router.activityWhen, event.payload)) {
+      await options.store.appendLedger({
+        event: "pollinate.router.activity_filtered",
+        trigger_id: options.trigger.id,
+        router: router.plugin,
+        subject_key: event.subjectKey,
+        event_kind: event.kind,
+        target: current.target.handle,
+      });
+      return { subjectKey: event.subjectKey, kind: event.kind, outcome: "dropped", reason: "activityWhen filter" };
+    }
     return routeToBinding(options, router, event, current);
   });
 }

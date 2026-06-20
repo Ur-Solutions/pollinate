@@ -266,6 +266,9 @@ plugin = "github-pr"
 openOn = ["github.pull_request.opened", "github.pull_request.reopened", "github.pull_request.ready_for_review"]
 closeOn = ["github.pull_request.closed", "github.pull_request.merged"]
 
+[trigger.router.activityWhen]
+event_kind = "github.pull_request.synchronize"
+
 [trigger.router.onOpen]
 kind = "honeybee"
 run = "spawn"

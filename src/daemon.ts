@@ -21,6 +21,8 @@ export class PollinateDaemon {
   private reloadTimer?: NodeJS.Timeout;
   private bindingGcTimer?: NodeJS.Timeout;
   private bindingGcRunning = false;
+  private jobGcTimer?: NodeJS.Timeout;
+  private jobGcRunning = false;
   private triggerSignature = "";
   private stopping = false;
 
@@ -54,6 +56,9 @@ export class PollinateDaemon {
     this.bindingGcTimer = setInterval(() => {
       void this.runBindingGc();
     }, config.defaults.bindingGcMs);
+    this.jobGcTimer = setInterval(() => {
+      void this.runJobGc();
+    }, config.defaults.jobGcMs);
     await this.store.appendLedger({
       event: "pollinate.daemon.started",
       trigger_count: triggers.length,
@@ -63,6 +68,7 @@ export class PollinateDaemon {
     });
     await this.log(`daemon started: ${triggers.length} triggers, webhook ${config.webhook.bind}:${config.webhook.port}, binding gc every ${config.defaults.bindingGcMs}ms`);
     void this.runBindingGc();
+    void this.runJobGc();
   }
 
   async stop(): Promise<void> {
@@ -70,6 +76,7 @@ export class PollinateDaemon {
     this.stopping = true;
     if (this.reloadTimer) clearInterval(this.reloadTimer);
     if (this.bindingGcTimer) clearInterval(this.bindingGcTimer);
+    if (this.jobGcTimer) clearInterval(this.jobGcTimer);
     await this.webhook?.stop();
     await this.poll?.stop();
     await this.schedule?.stop();
@@ -131,6 +138,22 @@ export class PollinateDaemon {
       await this.log(`binding gc failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       this.bindingGcRunning = false;
+    }
+  }
+
+  private async runJobGc(): Promise<void> {
+    if (this.stopping || this.jobGcRunning || !this.config) return;
+    this.jobGcRunning = true;
+    try {
+      const result = await this.store.archiveJobs({
+        retention: this.config.defaults.jobRetention,
+        maxJobs: this.config.defaults.maxJobs,
+      });
+      if (result.archived > 0) await this.log(`job gc: archived ${result.archived} of ${result.scanned} jobs`);
+    } catch (error) {
+      await this.log(`job gc failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.jobGcRunning = false;
     }
   }
 

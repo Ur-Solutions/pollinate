@@ -62,6 +62,7 @@ export type HoneybeeAction =
       kind: "honeybee";
       run: "spawn";
       bee: string;
+      account?: string;
       name?: string;
       colony?: string;
       home?: string;
@@ -105,6 +106,7 @@ export type RouterConfig = {
   openOn: string[];
   closeOn: string[];
   openWhen?: Filter;
+  activityWhen?: Filter;
   idleTtl?: string;
   onOpen: Action;
   onActivity: Action;
@@ -257,6 +259,9 @@ export type DaemonConfig = {
     tickMs: number;
     triggerReloadMs: number;
     bindingGcMs: number;
+    jobGcMs: number;
+    jobRetention: string;
+    maxJobs: number;
   };
   execution: ExecutionProfile;
 };

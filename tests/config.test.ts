@@ -54,10 +54,14 @@ idle_ttl = "48h"
 [trigger.router.open_when]
 pr_author = "trmdy"
 
+[trigger.router.activity_when]
+event_kind = "github.pull_request.synchronize"
+
 [trigger.router.on_open]
 kind = "honeybee"
 run = "spawn"
 bee = "codex"
+account = "auto"
 name = "pr-{{pr_number}}"
 
 [trigger.router.on_activity]
@@ -76,8 +80,9 @@ message = "{{activity_markdown}}"
       openOn: ["github.pull_request.opened"],
       closeOn: ["github.pull_request.merged"],
       openWhen: { pr_author: "trmdy" },
+      activityWhen: { event_kind: "github.pull_request.synchronize" },
       idleTtl: "48h",
-      onOpen: { kind: "honeybee", run: "spawn", bee: "codex", name: "pr-{{pr_number}}" },
+      onOpen: { kind: "honeybee", run: "spawn", bee: "codex", account: "auto", name: "pr-{{pr_number}}" },
       onActivity: { kind: "honeybee", run: "send", target: "{{binding.target}}" },
     });
     expect(parsed.router?.onClose).toBeUndefined();
@@ -204,6 +209,9 @@ public_url = "https://hooks.example.com"
 [defaults]
 binding_gc_ms = 30000
 trigger_reload_ms = 2000
+job_gc_ms = 120000
+job_retention = "3d"
+max_jobs = 500
 
 [execution]
 shell = "/bin/zsh"
@@ -213,6 +221,9 @@ shell_args = ["-lc"]
     expect(config.webhook).toMatchObject({ bind: "0.0.0.0", port: 4000, publicUrl: "https://hooks.example.com" });
     expect(config.defaults.bindingGcMs).toBe(30_000);
     expect(config.defaults.triggerReloadMs).toBe(2_000);
+    expect(config.defaults.jobGcMs).toBe(120_000);
+    expect(config.defaults.jobRetention).toBe("3d");
+    expect(config.defaults.maxJobs).toBe(500);
     expect(config.execution).toMatchObject({ shell: "/bin/zsh", shellArgs: ["-lc"] });
   });
 });

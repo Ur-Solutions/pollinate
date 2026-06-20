@@ -292,12 +292,42 @@ function renderJobOutcome(job: Job): string {
   return line;
 }
 
+const DEFAULT_JOBS_LIMIT = 20;
+
 async function cmdJobs(store: PollinateStore, args: ParsedArgs): Promise<void> {
+  if (args.rest[0] === "prune") {
+    await cmdJobsPrune(store, args);
+    return;
+  }
   const status = stringFlag(args, "status") as JobStatus | undefined;
   const triggerId = stringFlag(args, "trigger");
-  const last = numberFlag(args, "last");
+  const showAll = args.flags.all === true;
+  const last = numberFlag(args, "last") ?? (showAll ? undefined : DEFAULT_JOBS_LIMIT);
   const jobs = await store.listJobs({ status, triggerId, last });
-  print(args, jobs, renderJobList(jobs));
+  let human = renderJobList(jobs);
+  if (!args.json && last !== undefined && jobs.length >= last) {
+    const total = await store.countJobs();
+    if (total > jobs.length) {
+      human += `\n${c.dim(`showing ${jobs.length} of ${total} — pol jobs --all to see all, pol jobs prune to clean up`)}`;
+    }
+  }
+  print(args, jobs, human);
+}
+
+async function cmdJobsPrune(store: PollinateStore, args: ParsedArgs): Promise<void> {
+  const dryRun = Boolean(args.flags["dry-run"]);
+  const pruneAll = args.flags.all === true;
+  const olderThan = stringFlag(args, "older-than");
+  const max = numberFlag(args, "max");
+  const defaults = (await store.daemonConfig()).defaults;
+  const result = await store.archiveJobs({
+    // `--all` archives every terminal job regardless of age or count.
+    retention: pruneAll ? "0s" : (olderThan ?? defaults.jobRetention),
+    maxJobs: pruneAll ? 0 : (max ?? defaults.maxJobs),
+    dryRun,
+  });
+  const verb = dryRun ? "would archive" : "archived";
+  print(args, result, say.ok(`${verb} ${c.bold(String(result.archived))} of ${result.scanned} terminal jobs`));
 }
 
 async function cmdBindings(store: PollinateStore, args: ParsedArgs): Promise<void> {
@@ -1147,6 +1177,7 @@ function renderRouterDetail(router: RouterConfig): string {
     ["closeOn", router.closeOn.join(", ")],
   ];
   if (router.openWhen) rows.push(["openWhen", compactJson(router.openWhen)]);
+  if (router.activityWhen) rows.push(["activityWhen", compactJson(router.activityWhen)]);
   if (router.idleTtl) rows.push(["idleTtl", router.idleTtl]);
   rows.push(["onOpen", routerActionSummary(router.onOpen)]);
   rows.push(["onActivity", routerActionSummary(router.onActivity)]);
@@ -1438,6 +1469,7 @@ function actionFromFlags(args: ParsedArgs): Action {
       kind: "honeybee",
       run: "spawn",
       bee: requiredFlag(args, "bee", "Honeybee spawn actions require --bee <kind>"),
+      account: stringFlag(args, "account"),
       name: stringFlag(args, "name"),
       colony: stringFlag(args, "colony"),
       home: stringFlag(args, "home"),
@@ -1596,6 +1628,7 @@ function optionalFlagValue(key: string, next: string | undefined, consume: (valu
 function flagValue(key: string, argv: string[], consume: () => string): string | boolean {
   const booleanFlags = new Set([
     "json",
+    "all",
     "enabled",
     "disabled",
     "dry-run",
@@ -1699,7 +1732,8 @@ async function printHelp(): Promise<void> {
   out.push(
     helpSection("Fire & inspect", [
       ["trigger <id> [--dry-run]", "fire now; --payload '{…}' to pass data"],
-      ["jobs [--status <s>] [--last n]", "list recent jobs"],
+      ["jobs [--status <s>] [--last n] [--all]", "list recent jobs (default: last 20)"],
+      ["jobs prune [--older-than 7d] [--all]", "archive old terminal jobs (--dry-run to preview)"],
       ["job <jobId> | job cancel <id>", "inspect or cancel a job"],
       ["bindings [--trigger <id>]", "list router subject→target bindings"],
       ["bindings get <id>", "inspect a router binding"],

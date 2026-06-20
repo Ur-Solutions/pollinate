@@ -29,7 +29,16 @@ type AnyRecord = Record<string, unknown>;
 
 export const DEFAULT_DAEMON_CONFIG: DaemonConfig = {
   webhook: { bind: "127.0.0.1", port: 3978, relay: { maxAgeSeconds: 300 } },
-  defaults: { contextTimeout: "5s", commandTimeout: "10m", tickMs: 1_000, triggerReloadMs: 1_000, bindingGcMs: 60_000 },
+  defaults: {
+    contextTimeout: "5s",
+    commandTimeout: "10m",
+    tickMs: 1_000,
+    triggerReloadMs: 1_000,
+    bindingGcMs: 60_000,
+    jobGcMs: 300_000,
+    jobRetention: "7d",
+    maxJobs: 2_000,
+  },
   execution: {
     shell: "/bin/sh",
     shellArgs: ["-c"],
@@ -68,6 +77,9 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
       tickMs: numberOr(defaults.tickMs ?? defaults.tick_ms, DEFAULT_DAEMON_CONFIG.defaults.tickMs),
       triggerReloadMs: numberOr(defaults.triggerReloadMs ?? defaults.trigger_reload_ms, DEFAULT_DAEMON_CONFIG.defaults.triggerReloadMs),
       bindingGcMs: numberOr(defaults.bindingGcMs ?? defaults.binding_gc_ms, DEFAULT_DAEMON_CONFIG.defaults.bindingGcMs),
+      jobGcMs: numberOr(defaults.jobGcMs ?? defaults.job_gc_ms, DEFAULT_DAEMON_CONFIG.defaults.jobGcMs),
+      jobRetention: stringOr(defaults.jobRetention ?? defaults.job_retention, DEFAULT_DAEMON_CONFIG.defaults.jobRetention),
+      maxJobs: numberOr(defaults.maxJobs ?? defaults.max_jobs, DEFAULT_DAEMON_CONFIG.defaults.maxJobs),
     },
     execution: normalizeExecution(execution),
   };
@@ -308,6 +320,7 @@ function normalizeRouter(raw: AnyRecord | undefined): RouterConfig | undefined {
     openOn,
     closeOn,
     openWhen: normalizeFilter(asOptionalRecord(raw.openWhen ?? raw.open_when)),
+    activityWhen: normalizeFilter(asOptionalRecord(raw.activityWhen ?? raw.activity_when)),
     idleTtl: optionalString(raw.idleTtl ?? raw.idle_ttl),
     onOpen,
     onActivity,
@@ -363,6 +376,7 @@ function normalizeAction(raw: AnyRecord): Action {
         kind,
         run,
         bee: requiredString(raw.bee, "trigger.action.bee"),
+        account: optionalString(raw.account),
         name: optionalString(raw.name),
         colony: optionalString(raw.colony),
         home: optionalString(raw.home),

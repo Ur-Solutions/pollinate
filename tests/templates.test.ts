@@ -60,12 +60,14 @@ describe("renderAction", () => {
       kind: "honeybee",
       run: "spawn",
       bee: "codex",
+      account: "{{account}}",
       name: "pr-{{pr_number}}",
       message: "Review {{repo}}#{{pr_number}}",
       args: ["--allowedTools", "{{tools}}"],
     };
-    const rendered = renderAction(action, { pr_number: "12", repo: "trmd/demo", tools: "Read" });
+    const rendered = renderAction(action, { pr_number: "12", repo: "trmd/demo", tools: "Read", account: "auto" });
     expect(rendered.value).toMatchObject({
+      account: "auto",
       name: "pr-12",
       message: "Review trmd/demo#12",
       args: ["--allowedTools", "Read"],

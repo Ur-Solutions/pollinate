@@ -262,6 +262,7 @@ export class ActionExecutor {
     if (action.run === "spawn") {
       const spawnCwd = action.cwd ?? cwd;
       const flags = flagsFromRecord({
+        ...(action.account ? { account: action.account } : {}),
         ...(action.name ? { name: action.name } : {}),
         ...(action.colony ? { colony: action.colony } : {}),
         ...(action.home ? { home: action.home } : {}),

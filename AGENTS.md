@@ -28,6 +28,7 @@ everything here is otherwise only discoverable by reading the source.
   state/cursors.json              poll cursors
   state/router-bindings/<trigger>/<subject>.json   binding records
   jobs/<jobId>.json               one job per execution
+  jobs/archive.jsonl              compacted old terminal jobs (one per line)
   ledger.jsonl                    append-only event log (the source of truth)
   daemon.log                      daemon lifecycle + GC log (pol daemon logs)
   pollinate.toml                  daemon config
@@ -39,7 +40,7 @@ everything here is otherwise only discoverable by reading the source.
 |---|---|
 | `pol add / create / list / get / enable / disable / edit / remove` | trigger CRUD; `edit` validates the TOML on editor exit |
 | `pol trigger <id> [--payload '{…}'] [--dry-run]` | fire manually |
-| `pol jobs / job <id> / job cancel <id>` | job inspection |
+| `pol jobs [--last N] [--all] / jobs prune / job <id> / job cancel <id>` | job inspection + archival |
 | `pol bindings [--trigger <id>] / bindings get <id>` | router binding inspection |
 | `pol routers [list] / routers init <name>` | router plugin management |
 | `pol hooks / hook create|inbox|wait|gc|test` | webhook endpoints, temporary hooks |
@@ -159,8 +160,10 @@ closeOn = ["github.pull_request.closed", "github.pull_request.merged"]
 idleTtl = "48h"              # GC closes bindings idle longer than this
 [trigger.router.openWhen]    # same filter semantics, applied to the open event payload
 pr_author = "trmdy"
+[trigger.router.activityWhen] # same filter semantics, applied before onActivity
+event_kind = "github.pull_request.synchronize"
 [trigger.router.onOpen]      # action; its handle becomes binding.target
-[trigger.router.onActivity]  # action; runs for every non-open/non-close event
+[trigger.router.onActivity]  # action; runs for every non-open/non-close event matching activityWhen
 [trigger.router.onClose]     # optional; defaults to honeybee kill {{binding.target}}
 ```
 
@@ -266,6 +269,9 @@ commandTimeout = "10m"
 tickMs = 1000
 triggerReloadMs = 1000
 bindingGcMs = 60000          # router binding GC sweep interval
+jobGcMs = 300000             # job archive sweep interval (daemon)
+jobRetention = "7d"          # terminal jobs older than this are archived
+maxJobs = 2000               # also archive terminal jobs beyond the newest N
 
 [execution]                  # shell profile for command actions / polls
 shell = "/bin/sh"
@@ -281,12 +287,12 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 `event`. Stream with `pol ledger --follow`.
 
 - `pollinate.trigger.{added,enabled,disabled,removed}`
-- `pollinate.job.{queued,started,completed,errored,cancelled}`
+- `pollinate.job.{queued,started,completed,errored,cancelled,archived}`
 - `pollinate.delivery.{filtered,throttled}`
 - `pollinate.schedule.{fired,missed}` · `pollinate.poll.{checked,detected,errored}`
 - `pollinate.webhook.{received,rejected,duplicate}`
 - `pollinate.hook.{created,delivered,expired,gc_removed}`
-- `pollinate.router.{binding_pending,binding_created,binding_routed,binding_closed,binding_errored,binding_retry,binding_expired,binding_reconciled,already_bound,unbound,open_filtered,activity_errored,gc}`
+- `pollinate.router.{binding_pending,binding_created,binding_routed,binding_closed,binding_errored,binding_retry,binding_expired,binding_reconciled,already_bound,unbound,open_filtered,activity_filtered,closed_filtered,activity_errored,gc}`
 - `pollinate.router.plugin.created` · `pollinate.github.webhook.installed`
 - `pollinate.daemon.{started,stopped,triggers_reloaded,reload_errored}`
 - `pollinate.emit` (from `emit` actions)
@@ -294,5 +300,12 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 ## Job IDs
 
 Jobs use Honeybee-style IDs `<TRIGGER-PREFIX>.<uuid-prefix>` (e.g. `HE.a3f`).
-`pol job <ref>` accepts the visible id, the suffix, or a longer UUID prefix.
+`pol job <ref>` accepts the visible id, the suffix, or a longer UUID prefix,
+and resolves archived jobs (`jobs/archive.jsonl`) when no live file matches.
 Terminal statuses: `completed`, `errored`, `timed-out`, `cancelled`.
+
+`pol jobs` lists the most recent 20 by default (`--last N` / `--all` to widen);
+`listJobs` orders by file mtime and parses lazily so a bounded query never
+reads more job files than it returns. `pol jobs prune` (and the daemon's
+`jobGcMs` sweep) archive terminal jobs past `jobRetention` or the `maxJobs`
+cap into `jobs/archive.jsonl`; in-flight jobs are never archived.

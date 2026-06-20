@@ -1,4 +1,4 @@
-import { readdir, readFile, unlink } from "node:fs/promises";
+import { readdir, readFile, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
   appendJsonLine,
@@ -18,8 +18,29 @@ import {
 } from "./fsx.js";
 import { idFromPath, parseDaemonConfigToml, parseTriggerToml, triggerToToml } from "./config.js";
 import type { CursorState, DaemonConfig, DeliveryState, Job, JobStatus, LedgerEvent, RouterBinding, ScheduleState, Trigger } from "./types.js";
-import { nowIso } from "./time.js";
+import { nowIso, parseDuration } from "./time.js";
 import { allocateJobIdentity, matchesJobReference, type JobIdentity } from "./job-ids.js";
+
+const TERMINAL_JOB_STATUSES = new Set<JobStatus>(["completed", "errored", "timed-out", "cancelled"]);
+
+export type ArchiveJobsOptions = {
+  /** Archive terminal jobs whose terminal timestamp is older than this duration (e.g. "7d"). */
+  retention?: string;
+  /** Pre-parsed override for `retention`, in milliseconds. */
+  olderThanMs?: number;
+  /** Keep at most this many of the most-recent jobs; archive terminal jobs beyond the cap. */
+  maxJobs?: number;
+  /** Count what would be archived without touching any files. */
+  dryRun?: boolean;
+  now?: number;
+};
+
+export type ArchiveJobsResult = {
+  /** Number of job files moved into the archive (or that would be, when dryRun). */
+  archived: number;
+  /** Total job files inspected. */
+  scanned: number;
+};
 
 export class PollinateStore {
   readonly root: string;
@@ -38,6 +59,12 @@ export class PollinateStore {
 
   jobPath(id: string): string {
     return join(jobsDir(this.root), `${id}.json`);
+  }
+
+  jobArchivePath(): string {
+    // Lives under jobs/ but uses .jsonl so the readdir filters that pick up
+    // per-job ".json" files never treat the archive as a live job.
+    return join(jobsDir(this.root), "archive.jsonl");
   }
 
   routerBindingPath(triggerId: string, subjectKey: string): string {
@@ -181,7 +208,28 @@ export class PollinateStore {
   async getJob(id: string): Promise<Job | null> {
     const exact = await readJsonOr<Job | null>(this.jobPath(id), null);
     if (exact) return exact;
-    return this.resolveJobReference(id);
+    const live = await this.resolveJobReference(id);
+    if (live) return live;
+    return this.findArchivedJob(id);
+  }
+
+  private async findArchivedJob(reference: string): Promise<Job | null> {
+    const text = await readTextOrNull(this.jobArchivePath());
+    if (!text) return null;
+    const matches: Job[] = [];
+    for (const line of text.split(/\n/)) {
+      if (!line.trim()) continue;
+      let job: Job;
+      try {
+        job = JSON.parse(line) as Job;
+      } catch {
+        continue;
+      }
+      if (matchesJobReference(job, reference)) matches.push(job);
+    }
+    if (matches.length === 0) return null;
+    matches.sort((a, b) => b.queuedAt.localeCompare(a.queuedAt));
+    return matches[0];
   }
 
   async updateJob(id: string, patch: Partial<Job>): Promise<Job> {
@@ -194,19 +242,79 @@ export class PollinateStore {
 
   async listJobs(options: { status?: JobStatus; triggerId?: string; last?: number } = {}): Promise<Job[]> {
     await this.ensure();
-    const entries = await readdir(jobsDir(this.root)).catch(() => []);
+    const dir = jobsDir(this.root);
+    const names = await this.jobFileNamesByRecency(dir);
+    // Parse lazily in recency order so a bounded `last` query never reads more
+    // job files than it returns — the store may hold thousands of records.
     const jobs: Job[] = [];
-    for (const entry of entries.filter((item) => item.endsWith(".json"))) {
-      const job = await readJsonOr<Job | null>(join(jobsDir(this.root), entry), null);
-      if (job) jobs.push(job);
+    for (const name of names) {
+      const job = await readJsonOr<Job | null>(join(dir, name), null);
+      if (!job) continue;
+      if (options.status && job.status !== options.status) continue;
+      if (options.triggerId && job.triggerId !== options.triggerId) continue;
+      jobs.push(job);
+      if (options.last !== undefined && jobs.length >= options.last) break;
     }
     jobs.sort((a, b) => b.queuedAt.localeCompare(a.queuedAt));
-    const filtered = jobs.filter((job) => {
-      if (options.status && job.status !== options.status) return false;
-      if (options.triggerId && job.triggerId !== options.triggerId) return false;
-      return true;
+    return jobs;
+  }
+
+  /** Cheap count of live job files (no JSON parsing). */
+  async countJobs(): Promise<number> {
+    await this.ensure();
+    const entries = await readdir(jobsDir(this.root)).catch(() => []);
+    return entries.filter(isJobFile).length;
+  }
+
+  /**
+   * Compacts terminal jobs that are older than the retention window — or beyond
+   * the count cap — into `jobs/archive.jsonl` and removes their individual files,
+   * so the live jobs directory (and every readdir over it) stays small. In-flight
+   * jobs are never archived. The ledger already records job lifecycle events, and
+   * `getJob` still resolves archived ids, so nothing observable is lost.
+   */
+  async archiveJobs(options: ArchiveJobsOptions = {}): Promise<ArchiveJobsResult> {
+    await this.ensure();
+    const dir = jobsDir(this.root);
+    const now = options.now ?? Date.now();
+    const retentionMs = options.olderThanMs ?? (options.retention !== undefined ? parseDuration(options.retention) : undefined);
+    const entries = (await readdir(dir).catch(() => [])).filter(isJobFile);
+
+    const records: Array<{ name: string; job: Job; terminal: boolean; sortKey: number }> = [];
+    for (const name of entries) {
+      const job = await readJsonOr<Job | null>(join(dir, name), null);
+      if (!job) continue;
+      const sortKey = new Date(job.completedAt ?? job.queuedAt).getTime();
+      records.push({ name, job, terminal: TERMINAL_JOB_STATUSES.has(job.status), sortKey });
+    }
+    records.sort((a, b) => b.sortKey - a.sortKey);
+
+    const doomed = records.filter((record, index) => {
+      if (!record.terminal) return false;
+      const tooOld = retentionMs !== undefined && now - record.sortKey >= retentionMs;
+      const overCap = options.maxJobs !== undefined && index >= options.maxJobs;
+      return tooOld || overCap;
     });
-    return options.last ? filtered.slice(0, options.last) : filtered;
+
+    if (!options.dryRun) {
+      for (const record of doomed) {
+        await appendJsonLine(this.jobArchivePath(), record.job);
+        await unlink(join(dir, record.name)).catch(() => undefined);
+      }
+      if (doomed.length) {
+        await this.appendLedger({ event: "pollinate.job.archived", count: doomed.length, scanned: records.length });
+      }
+    }
+    return { archived: doomed.length, scanned: records.length };
+  }
+
+  private async jobFileNamesByRecency(dir: string): Promise<string[]> {
+    const names = (await readdir(dir).catch(() => [])).filter(isJobFile);
+    const stamped = await Promise.all(
+      names.map(async (name) => ({ name, mtimeMs: (await stat(join(dir, name)).catch(() => null))?.mtimeMs ?? 0 })),
+    );
+    stamped.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    return stamped.map((entry) => entry.name);
   }
 
   async cancelJob(id: string): Promise<Job> {
@@ -248,6 +356,10 @@ export class PollinateStore {
     const all = text.split(/\n/).filter(Boolean);
     return lines ? all.slice(-lines) : all;
   }
+}
+
+function isJobFile(name: string): boolean {
+  return name.endsWith(".json");
 }
 
 function safePathPart(value: string): string {

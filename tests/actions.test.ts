@@ -92,6 +92,19 @@ describe("ActionExecutor honeybee argv execution", () => {
     });
   });
 
+  test("spawn passes the selected hive account", async () => {
+    await withTempStore(async (store, root) => {
+      const hive = await installHiveStub(root);
+      try {
+        const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
+        await executor.executeAction({ kind: "honeybee", run: "spawn", bee: "codex", account: "auto", name: "account-test" });
+        expect(await hive.log()).toContain("spawn codex --account auto --name account-test");
+      } finally {
+        hive.restore();
+      }
+    });
+  });
+
   test("spawn fails loudly when hive output contains no parsable handle", async () => {
     await withTempStore(async (store, root) => {
       const hiveLog = join(root, "hive.log");
