@@ -171,6 +171,12 @@ export type SidebarDeps = {
   renderTriggerPreview: (trigger: Trigger) => string;
   renderJobPreview: (job: Job) => string;
   renderBindingPreview: (binding: RouterBinding) => string;
+  /**
+   * Show a preview in a centered popup over the whole window (tmux display-popup).
+   * Resolves true if it displayed one (blocks until closed), false to fall back
+   * to the in-pane overlay (e.g. outside tmux).
+   */
+  openPopup?: (title: string, text: string) => Promise<boolean>;
   runNow: (trigger: Trigger, payloadJson: string) => Promise<string>;
   toggleEnabled: (trigger: Trigger) => Promise<string>;
   cancelJob: (job: Job) => Promise<string>;
@@ -304,6 +310,20 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
           : row.kind === "job" ? deps.renderJobPreview(row.job)
           : deps.renderBindingPreview(row.binding);
         const title = row.kind === "trigger" ? row.trigger.id : row.id;
+        if (deps.openPopup) {
+          // Centered popup over the whole window; blocks until the operator closes it.
+          message = `preview: ${title}`;
+          render();
+          void deps
+            .openPopup(title, text)
+            .then((shown) => {
+              if (done) return;
+              if (!shown) dialog = { kind: "preview", title, lines: text.split("\n"), scroll: 0 };
+              render();
+            })
+            .catch((error) => flash(error instanceof Error ? error.message : String(error)));
+          return;
+        }
         dialog = { kind: "preview", title, lines: text.split("\n"), scroll: 0 };
         render();
       };

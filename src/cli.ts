@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PollinateStore } from "./store.js";
 import { ActionExecutor, createExecutor, fireTriggerNow, parseHiveHandle } from "./actions.js";
 import { parseDuration, sleep, nowIso } from "./time.js";
 import { parseTriggerToml, slugify, triggerToToml } from "./config.js";
-import { execArgv } from "./process.js";
+import { execArgv, shellQuote } from "./process.js";
+import { tmux } from "./tmux.js";
 import { isSidebarTab, readSidebarTab, toggleSidebar, writeSidebarTab, type SidebarTab } from "./sidebar.js";
 import { runSidebarTui, type NewTriggerDraft, type SidebarData } from "./sidebarTui.js";
 import { applyWebhookTransform } from "./webhook.js";
@@ -306,7 +308,9 @@ async function cmdJobs(store: PollinateStore, args: ParsedArgs): Promise<void> {
 async function cmdSidebar(store: PollinateStore, args: ParsedArgs): Promise<void> {
   if (args.flags["toggle-sidebar"]) {
     const state = await toggleSidebar(numberFlag(args, "width"));
-    print(args, { state }, state === "opened" ? say.ok("sidebar opened") : say.ok("sidebar closed"));
+    // Stay silent in human mode: this is bound to a key via tmux `run-shell`,
+    // which would otherwise pop the stdout into a copy-mode view over the screen.
+    if (args.json) console.log(JSON.stringify({ state }, null, 2));
     return;
   }
 
@@ -342,6 +346,7 @@ async function cmdSidebar(store: PollinateStore, args: ParsedArgs): Promise<void
     renderTriggerPreview: (trigger) => renderTrigger(trigger),
     renderJobPreview: (job) => renderJob(job),
     renderBindingPreview: (binding) => renderBinding(binding),
+    openPopup: (title, text) => openPreviewPopup(title, text),
     runNow: async (trigger, payloadJson) => {
       const job = await fireTriggerNow(store, trigger, parsePayload(payloadJson));
       return `${jobBadge(job.status)} ${shortId(job.id)}`;
@@ -384,6 +389,28 @@ async function cmdSidebar(store: PollinateStore, args: ParsedArgs): Promise<void
       return handle ? `authoring with ${handle}` : "spawned hive authoring session";
     },
   });
+}
+
+/**
+ * Show rendered text in a centered tmux popup over the whole window (so a preview
+ * isn't cramped into the narrow sidebar pane). Returns false outside tmux so the
+ * caller can fall back to an in-pane overlay. `less -R` keeps the ANSI colors and
+ * closes on `q`; `display-popup -E` then tears the popup down.
+ */
+async function openPreviewPopup(title: string, text: string): Promise<boolean> {
+  if (!process.env.TMUX) return false;
+  const file = join(tmpdir(), `pol-preview-${process.pid}-${Date.now()}.txt`);
+  await writeFile(file, `${title}\n\n${text}\n`, "utf8");
+  const q = shellQuote(file);
+  // The popup deletes its own file after `less` exits, so cleanup never races
+  // `less` — display-popup returns immediately when invoked from within the
+  // client's own pane (rather than blocking until close). `less -R` keeps ANSI.
+  const result = await tmux(["display-popup", "-E", "-w", "85%", "-h", "85%", `less -R -- ${q}; rm -f ${q}`]);
+  if (!result.ok) {
+    await rm(file, { force: true }); // no attached client / unsupported → in-pane fallback
+    return false;
+  }
+  return true;
 }
 
 function triggerFromDraft(draft: NewTriggerDraft): Trigger {
