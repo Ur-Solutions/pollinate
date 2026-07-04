@@ -3,6 +3,9 @@ import { ActionExecutor } from "./actions.js";
 import { matchesFilter } from "./filter.js";
 import { PollinateStore } from "./store.js";
 import { nowIso, parseDuration } from "./time.js";
+import { appendTextLine, daemonLogPath } from "./fsx.js";
+
+const DEBOUNCE_MAX_WAIT_MULTIPLIER = 6;
 
 type RuntimeState = {
   running: number;
@@ -23,7 +26,7 @@ export class DeliveryManager {
 
   async init(triggers: Trigger[]): Promise<void> {
     this.triggers = new Map(triggers.map((trigger) => [trigger.id, trigger]));
-    this.persisted = await this.store.readDeliveryState();
+    if (!this.restored) this.persisted = await this.store.readDeliveryState();
     if (this.pruneOrphanedState()) await this.persist();
     if (!this.restored) {
       this.restored = true;
@@ -64,12 +67,12 @@ export class DeliveryManager {
         runtime.queue.push({ ...queued, trigger });
       }
       if (state.pendingBatch?.length && state.timerDueAt && state.timerKind) {
-        const delay = Math.max(0, new Date(state.timerDueAt).getTime() - now);
+        const delay = this.pendingTimerDelayMs(trigger, state, now);
         runtime.timer = setTimeout(() => {
-          void this.flushPending(trigger);
+          this.runFlushPending(trigger);
         }, delay);
       }
-      void this.drain(trigger);
+      this.runDrain(trigger);
     }
   }
 
@@ -135,11 +138,16 @@ export class DeliveryManager {
     const mode = trigger.delivery.mode;
     if (mode.strategy !== "debounced") return null;
     const state = this.persistedFor(trigger.id);
+    const now = Date.now();
+    const quietMs = parseDuration(mode.quietPeriod);
     state.pendingBatch = [...(state.pendingBatch ?? []), activation];
-    state.timerDueAt = new Date(Date.now() + parseDuration(mode.quietPeriod)).toISOString();
+    const maxDueAt = this.debounceMaxDueAt(state.pendingBatch, quietMs, now);
+    const dueAt = Math.min(now + quietMs, maxDueAt);
+    state.timerDueAt = new Date(dueAt).toISOString();
     state.timerKind = "debounced";
     this.persisted[trigger.id] = state;
-    this.setTimer(trigger, parseDuration(mode.quietPeriod), "debounced");
+    if (dueAt <= now) return this.flushPending(trigger);
+    this.setTimer(trigger, dueAt - now, "debounced");
     await this.persist();
     return null;
   }
@@ -182,7 +190,7 @@ export class DeliveryManager {
     const runtime = this.runtimeFor(trigger.id);
     runtime.queue.push({ job, trigger, activation, batch });
     await this.saveQueue(trigger.id);
-    void this.drain(trigger);
+    this.runDrain(trigger);
     return job;
   }
 
@@ -191,24 +199,34 @@ export class DeliveryManager {
     while (runtime.running < trigger.delivery.maxConcurrent && runtime.queue.length > 0) {
       const next = runtime.queue.shift();
       if (!next) return;
-      await this.saveQueue(trigger.id);
-      const latest = await this.store.getJob(next.job.id);
-      if (latest?.status === "cancelled") continue;
       runtime.running += 1;
-      this.executor
-        .executeJob(next.job, next.trigger, next.activation, next.batch)
-        .catch((error) =>
-          this.store.appendLedger({
-            event: "pollinate.job.errored",
-            job_id: next.job.id,
-            trigger_id: next.trigger.id,
-            error: error instanceof Error ? error.message : String(error),
-          }),
-        )
-        .finally(() => {
-          runtime.running = Math.max(0, runtime.running - 1);
-          void this.drain(trigger);
-        });
+      let handedOff = false;
+      try {
+        await this.saveQueue(trigger.id);
+        const latest = await this.store.getJob(next.job.id);
+        if (latest?.status === "cancelled") continue;
+        handedOff = true;
+        this.executor
+          .executeJob(next.job, next.trigger, next.activation, next.batch)
+          .catch((error) => {
+            void this.store.appendLedger({
+              event: "pollinate.job.errored",
+              job_id: next.job.id,
+              trigger_id: next.trigger.id,
+              error: error instanceof Error ? error.message : String(error),
+            }).catch((ledgerError) => this.logAsyncError("job error ledger", next.trigger, ledgerError));
+          })
+          .finally(() => {
+            runtime.running = Math.max(0, runtime.running - 1);
+            this.runDrain(trigger);
+          });
+      } catch (error) {
+        runtime.queue.unshift(next);
+        await this.saveQueue(trigger.id).catch(() => undefined);
+        throw error;
+      } finally {
+        if (!handedOff) runtime.running = Math.max(0, runtime.running - 1);
+      }
     }
   }
 
@@ -216,12 +234,48 @@ export class DeliveryManager {
     const runtime = this.runtimeFor(trigger.id);
     if (runtime.timer) clearTimeout(runtime.timer);
     runtime.timer = setTimeout(() => {
-      void this.flushPending(trigger);
+      this.runFlushPending(trigger);
     }, delayMs);
     const state = this.persistedFor(trigger.id);
     state.timerKind = kind;
     state.timerDueAt = new Date(Date.now() + delayMs).toISOString();
     this.persisted[trigger.id] = state;
+  }
+
+  private pendingTimerDelayMs(trigger: Trigger, state: NonNullable<DeliveryState[string]>, now: number): number {
+    let dueAt = state.timerDueAt ? this.timeMsOr(state.timerDueAt, now) : now;
+    if (state.timerKind === "debounced" && trigger.delivery.mode.strategy === "debounced" && state.pendingBatch?.length) {
+      dueAt = Math.min(dueAt, this.debounceMaxDueAt(state.pendingBatch, parseDuration(trigger.delivery.mode.quietPeriod), now));
+    }
+    return Math.max(0, dueAt - now);
+  }
+
+  private debounceMaxDueAt(pending: Activation[], quietMs: number, fallback: number): number {
+    const first = pending[0];
+    const firstSeenAt = first ? this.timeMsOr(first.receivedAt, fallback) : fallback;
+    return firstSeenAt + quietMs * DEBOUNCE_MAX_WAIT_MULTIPLIER;
+  }
+
+  private timeMsOr(value: string, fallback: number): number {
+    const parsed = new Date(value).getTime();
+    return Number.isNaN(parsed) ? fallback : parsed;
+  }
+
+  private runDrain(trigger: Trigger): void {
+    void this.drain(trigger).catch((error) => this.logAsyncError("drain", trigger, error));
+  }
+
+  private runFlushPending(trigger: Trigger): void {
+    void this.flushPending(trigger).catch((error) => this.logAsyncError("flushPending", trigger, error));
+  }
+
+  private async logAsyncError(operation: string, trigger: Trigger, error: unknown): Promise<void> {
+    try {
+      const message = error instanceof Error ? error.message : String(error);
+      await appendTextLine(daemonLogPath(this.store.root), `${nowIso()} delivery ${operation} failed for ${trigger.id}: ${message}`);
+    } catch {
+      // Delivery-side error logging must not become another unhandled rejection.
+    }
   }
 
   private runtimeFor(triggerId: string): RuntimeState {
