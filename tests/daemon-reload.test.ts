@@ -11,9 +11,10 @@ async function waitForLedgerEvent(
 ): Promise<Record<string, unknown>> {
   const start = Date.now();
   for (;;) {
-    const match = (await store.readLedger())
+    const matches = (await store.readLedger())
       .map((line) => JSON.parse(line) as Record<string, unknown>)
-      .findLast((entry) => entry.event === event);
+      .filter((entry: Record<string, unknown>) => entry.event === event);
+    const match = matches[matches.length - 1];
     if (match) return match;
     if (Date.now() - start > timeoutMs) throw new Error(`Timed out waiting for ledger event ${event}`);
     await new Promise((resolve) => setTimeout(resolve, 20));
