@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readdir, readFile } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { atomicWriteFile, jobsDir, readJsonOr, stateDir, withFileLock } from "./fsx.js";
 import type { Job, Trigger } from "./types.js";
@@ -14,6 +14,10 @@ type JobIdIndex = {
   used: string[];
 };
 
+type ReadJobIdIndex = JobIdIndex & {
+  repairFromJobs: boolean;
+};
+
 export type AllocateJobIdentityOptions = {
   root: string;
   trigger: Trigger;
@@ -25,7 +29,7 @@ export const MIN_JOB_ID_CHARS = 3;
 export async function allocateJobIdentity(options: AllocateJobIdentityOptions): Promise<JobIdentity> {
   return withFileLock(jobIdIndexLockPath(options.root), async () => {
     const indexed = await readJobIdIndex(options.root);
-    const used = await mergeCurrentJobUuids(options.root, indexed.used);
+    const used = indexed.repairFromJobs ? await mergeCurrentJobUuids(options.root, indexed.used) : indexed.used;
     const uuidFactory = options.uuid ?? randomUUID;
     const idPrefix = jobPrefixForTrigger(options.trigger);
 
@@ -42,6 +46,24 @@ export async function allocateJobIdentity(options: AllocateJobIdentityOptions): 
     }
 
     throw new Error("Could not allocate a unique job id after 100000 UUID attempts");
+  });
+}
+
+export async function pruneJobIdIndex(root: string, uuids: Iterable<string>): Promise<number> {
+  const remove = new Set<string>();
+  for (const uuid of uuids) {
+    const normalized = maybeNormalizeJobUuid(uuid);
+    if (normalized) remove.add(normalized);
+  }
+  if (remove.size === 0) return 0;
+
+  return withFileLock(jobIdIndexLockPath(root), async () => {
+    const indexed = await readJobIdIndex(root);
+    const used = indexed.repairFromJobs ? await mergeCurrentJobUuids(root, indexed.used) : indexed.used;
+    const next = used.filter((uuid) => !remove.has(uuid));
+    if (next.length === used.length) return 0;
+    await writeJobIdIndex(root, { used: next });
+    return used.length - next.length;
   });
 }
 
@@ -135,15 +157,14 @@ async function currentJobUuids(root: string): Promise<string[]> {
   return uuids;
 }
 
-async function readJobIdIndex(root: string): Promise<JobIdIndex> {
-  try {
-    const parsed = JSON.parse(await readFile(jobIdIndexPath(root), "utf8")) as unknown;
-    const object = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
-    return { used: Array.isArray(object.used) ? object.used.map((value) => normalizeJobUuid(String(value))).sort() : [] };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { used: [] };
-    throw error;
-  }
+async function readJobIdIndex(root: string): Promise<ReadJobIdIndex> {
+  const parsed = await readJsonOr<unknown | undefined>(jobIdIndexPath(root), undefined);
+  if (parsed === undefined) return { used: [], repairFromJobs: true };
+  const object = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  return {
+    used: Array.isArray(object.used) ? normalizeKnownJobUuids(object.used).sort() : [],
+    repairFromJobs: false,
+  };
 }
 
 async function writeJobIdIndex(root: string, index: JobIdIndex): Promise<void> {
@@ -156,6 +177,15 @@ function jobIdIndexPath(root: string): string {
 
 function jobIdIndexLockPath(root: string): string {
   return join(stateDir(root), "job-id-index.lock");
+}
+
+function normalizeKnownJobUuids(values: unknown[]): string[] {
+  const used = new Set<string>();
+  for (const value of values) {
+    const uuid = maybeNormalizeJobUuid(String(value));
+    if (uuid) used.add(uuid);
+  }
+  return [...used];
 }
 
 function insertionIndex(sorted: readonly string[], value: string): number {
