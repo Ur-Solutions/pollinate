@@ -8,12 +8,31 @@ import { installCommandStub, installHiveStub, trigger, waitForJobs, waitForTermi
 describe("delivery manager", () => {
   test("filters block nonmatching activations and allow equality/existence matches", async () => {
     await withTempStore(async (store) => {
-      const trig = trigger({ id: "filtered", filter: { status: "done", agent: true } });
+      const trig = trigger({ id: "filtered", filter: { status: "done", agent: true, meta: { b: 2, a: 1 } } });
       const delivery = new DeliveryManager(store, new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 }));
       await delivery.init([trig]);
-      expect(await delivery.handle(trig, { triggerId: trig.id, source: "manual", payload: { status: "running", agent: "codex" }, receivedAt: new Date().toISOString() })).toBeNull();
-      expect(await delivery.handle(trig, { triggerId: trig.id, source: "manual", payload: { status: "done" }, receivedAt: new Date().toISOString() })).toBeNull();
-      const job = await delivery.handle(trig, { triggerId: trig.id, source: "manual", payload: { status: "done", agent: "codex" }, receivedAt: new Date().toISOString() });
+      expect(
+        await delivery.handle(trig, {
+          triggerId: trig.id,
+          source: "manual",
+          payload: { status: "running", agent: "codex", meta: { a: 1, b: 2 } },
+          receivedAt: new Date().toISOString(),
+        }),
+      ).toBeNull();
+      expect(
+        await delivery.handle(trig, {
+          triggerId: trig.id,
+          source: "manual",
+          payload: { status: "done", meta: { a: 1, b: 2 } },
+          receivedAt: new Date().toISOString(),
+        }),
+      ).toBeNull();
+      const job = await delivery.handle(trig, {
+        triggerId: trig.id,
+        source: "manual",
+        payload: { status: "done", agent: "codex", meta: { a: 1, b: 2 } },
+        receivedAt: new Date().toISOString(),
+      });
       expect(job).not.toBeNull();
       await waitForTerminalJobs(store, 1);
       await delivery.shutdown();

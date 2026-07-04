@@ -27,6 +27,8 @@ import { parseDuration } from "./time.js";
 
 type AnyRecord = Record<string, unknown>;
 
+const DEFAULT_MAX_BATCH = 1_000;
+
 export const DEFAULT_DAEMON_CONFIG: DaemonConfig = {
   webhook: { bind: "127.0.0.1", port: 3978, relay: { maxAgeSeconds: 300 } },
   defaults: { contextTimeout: "5s", commandTimeout: "10m", tickMs: 1_000, triggerReloadMs: 1_000, bindingGcMs: 60_000 },
@@ -101,7 +103,7 @@ function normalizeTrigger(raw: AnyRecord, fallbackId?: string): Trigger {
   const name = stringOr(raw.name, fallbackId ?? "trigger");
   const id = stringOr(raw.id, fallbackId ?? slugify(name));
   const source = normalizeSource(asRecord(raw.source, "trigger.source"));
-  const delivery = normalizeDelivery(asRecord(raw.delivery, "trigger.delivery"));
+  const delivery = normalizeDelivery(raw.delivery === undefined ? undefined : asRecord(raw.delivery, "trigger.delivery"));
   const router = normalizeRouter(asOptionalRecord(raw.router));
   const actionRaw = asOptionalRecord(raw.action);
   if (!actionRaw && !router) throw new Error("Trigger requires either [trigger.action] or [trigger.router]");
@@ -168,10 +170,12 @@ function normalizeTiming(raw: AnyRecord): ScheduleTiming {
   const missedFirePolicy = normalizeMissedFirePolicy(raw.missedFirePolicy ?? raw.missed_fire_policy);
   if (type === "cron") {
     const expression = requiredString(raw.expression, "trigger.source.timing.expression");
+    const timezone = stringOr(raw.timezone, "UTC");
+    validateCronTiming(expression, timezone);
     return {
       type,
       expression,
-      timezone: stringOr(raw.timezone, "UTC"),
+      timezone,
       ...(missedFirePolicy ? { missedFirePolicy } : {}),
     };
   }
@@ -232,17 +236,20 @@ function normalizeWebhook(raw: AnyRecord): WebhookSpec {
   };
 }
 
-function normalizeDelivery(raw: AnyRecord): Delivery {
-  const maxConcurrent = Math.max(1, numberOr(raw.maxConcurrent ?? raw.max_concurrent, 1));
+function normalizeDelivery(raw: AnyRecord | undefined): Delivery {
+  const value = raw ?? {};
+  const maxConcurrent = Math.max(1, numberOr(value.maxConcurrent ?? value.max_concurrent, 1));
   return {
-    mode: normalizeDeliveryMode(raw),
+    mode: normalizeDeliveryMode(value),
     maxConcurrent,
   };
 }
 
 function normalizeDeliveryMode(raw: AnyRecord): DeliveryMode {
   const modeRaw = asOptionalRecord(raw.mode);
-  const strategy = stringOr(modeRaw?.strategy ?? raw.strategy ?? raw.mode, "");
+  const strategyValue = modeRaw?.strategy ?? raw.strategy ?? raw.mode;
+  if (strategyValue === undefined) return { strategy: "immediate" };
+  const strategy = stringOr(strategyValue, "");
   if (strategy === "immediate") return { strategy };
   if (strategy === "throttled") {
     const interval = requiredString(modeRaw?.interval ?? raw.interval, "trigger.delivery.interval");
@@ -252,7 +259,7 @@ function normalizeDeliveryMode(raw: AnyRecord): DeliveryMode {
   if (strategy === "batched") {
     const window = requiredString(modeRaw?.window ?? raw.window, "trigger.delivery.window");
     parseDuration(window);
-    return { strategy, window, maxBatch: Math.max(1, numberOr(modeRaw?.maxBatch ?? modeRaw?.max_batch ?? raw.maxBatch ?? raw.max_batch, 1)) };
+    return { strategy, window, maxBatch: Math.max(1, numberOr(modeRaw?.maxBatch ?? modeRaw?.max_batch ?? raw.maxBatch ?? raw.max_batch, DEFAULT_MAX_BATCH)) };
   }
   if (strategy === "debounced") {
     const quietPeriod = requiredString(
@@ -272,6 +279,9 @@ function normalizeFilter(raw: AnyRecord | undefined): Filter | undefined {
 
 function normalizeContext(raw: AnyRecord | undefined): ContextResolver | undefined {
   if (!raw) return undefined;
+  if (raw.sources !== undefined && !Array.isArray(raw.sources)) {
+    throw new Error("trigger.context.sources must be an array of tables — use [[trigger.context.sources]]");
+  }
   const sources = Array.isArray(raw.sources)
     ? raw.sources.map((entry, index) => normalizeContextSource(asRecord(entry, `trigger.context.sources[${index}]`)))
     : undefined;
@@ -442,6 +452,81 @@ function normalizeMissedFirePolicy(value: unknown): ScheduleTiming["missedFirePo
   const policy = String(value);
   if (policy === "skip" || policy === "fire-once" || policy === "fire-all") return policy;
   throw new Error(`Unsupported missed-fire policy: ${policy}`);
+}
+
+type CronValidationFields = {
+  dayOfMonth: Set<number>;
+  month: Set<number>;
+  domAny: boolean;
+  dowAny: boolean;
+};
+
+function validateCronTiming(expression: string, timezone: string): void {
+  try {
+    new Intl.DateTimeFormat(undefined, { timeZone: timezone });
+  } catch {
+    throw new Error(`Invalid cron timezone: ${timezone}`);
+  }
+
+  const fields = parseCronValidationFields(expression);
+  if (!fields.domAny && fields.dowAny && !hasPossibleDayOfMonth(fields.dayOfMonth, fields.month)) {
+    throw new Error(`Cron expression can never match a selected day in selected months: ${expression}`);
+  }
+}
+
+function parseCronValidationFields(expression: string): CronValidationFields {
+  const parts = expression.trim().split(/\s+/);
+  if (parts.length !== 5) throw new Error(`Cron expression must have 5 fields: ${expression}`);
+  const [minute, hour, dom, month, dow] = parts;
+  parseCronValidationField(minute, 0, 59);
+  parseCronValidationField(hour, 0, 23);
+  const dayOfMonth = parseCronValidationField(dom, 1, 31);
+  const months = parseCronValidationField(month, 1, 12);
+  parseCronValidationField(dow.replace(/\b7\b/g, "0"), 0, 6);
+  return {
+    dayOfMonth,
+    month: months,
+    domAny: dom === "*",
+    dowAny: dow === "*",
+  };
+}
+
+function parseCronValidationField(field: string, min: number, max: number): Set<number> {
+  const out = new Set<number>();
+  for (const token of field.split(",")) {
+    if (!token) throw new Error(`Invalid cron field "${field}"`);
+    const [rangePart, stepPart] = token.split("/");
+    const step = stepPart ? Number(stepPart) : 1;
+    if (!Number.isInteger(step) || step <= 0) throw new Error(`Invalid cron step: ${token}`);
+    let start: number;
+    let end: number;
+    if (rangePart === "*") {
+      start = min;
+      end = max;
+    } else if (rangePart.includes("-")) {
+      const [rawStart, rawEnd] = rangePart.split("-");
+      start = Number(rawStart);
+      end = Number(rawEnd);
+    } else {
+      start = Number(rangePart);
+      end = start;
+    }
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < min || end > max || start > end) {
+      throw new Error(`Invalid cron field "${field}"`);
+    }
+    for (let value = start; value <= end; value += step) out.add(value);
+  }
+  return out;
+}
+
+function hasPossibleDayOfMonth(dayOfMonth: Set<number>, months: Set<number>): boolean {
+  for (const month of months) {
+    const maxDay = month === 2 ? 29 : [4, 6, 9, 11].includes(month) ? 30 : 31;
+    for (const day of dayOfMonth) {
+      if (day <= maxDay) return true;
+    }
+  }
+  return false;
 }
 
 function stripRuntimeDates(trigger: Trigger): AnyRecord {
