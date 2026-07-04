@@ -99,6 +99,7 @@ function normalizePullRequestReview(body: AnyRecord): CanonicalRouterEvent[] {
   if (!repo || !pr) return [];
   const action = stringValue(body.action, "unknown");
   const review = asRecord(body.review);
+  if (markedPollinateRouterComment(stringValue(review?.body))) return [];
   return [
     eventForPr(body, repo, pr, `github.pull_request_review.${action}`, clean({
       activity_url: stringValue(review?.html_url),
