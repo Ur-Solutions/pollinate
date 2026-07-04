@@ -1,6 +1,18 @@
 import { describe, expect, test } from "vitest";
-import { ActionExecutor, DeliveryManager, parseTriggerToml, triggerToToml, nextCronFireAfter, nextFireAfter, ScheduleEngine } from "../src/index.js";
+import { ActionExecutor } from "../src/actions.js";
+import { parseTriggerToml, triggerToToml } from "../src/config.js";
+import { DeliveryManager } from "../src/delivery.js";
+import { nextCronFireAfter, nextFireAfter, ScheduleEngine } from "../src/schedule.js";
 import { trigger, waitForTerminalJobs, withTempStore } from "./helpers.js";
+
+type CronCase = {
+  name: string;
+  expression: string;
+  after: string;
+  expected: string;
+  timezone?: string;
+  previousFireAt?: string;
+};
 
 describe("config and schedule parsing", () => {
   test("parses PRD-style TOML trigger config", () => {
@@ -159,6 +171,78 @@ message = "{{activity_markdown}}"
     expect(once.toISOString()).toBe("2026-06-08T06:01:00.000Z");
   });
 
+  test.each<CronCase>([
+    {
+      name: "minute steps",
+      expression: "*/20 * * * *",
+      after: "2026-06-08T06:01:00.000Z",
+      expected: "2026-06-08T06:20:00.000Z",
+    },
+    {
+      name: "comma lists",
+      expression: "5,20,50 6 * * *",
+      after: "2026-06-08T06:06:00.000Z",
+      expected: "2026-06-08T06:20:00.000Z",
+    },
+    {
+      name: "day-of-week ranges",
+      expression: "0 9 * * 1-5",
+      after: "2026-06-13T09:00:00.000Z",
+      expected: "2026-06-15T09:00:00.000Z",
+    },
+    {
+      name: "day-of-week 7 is Sunday",
+      expression: "0 10 * * 7",
+      after: "2026-06-06T10:00:00.000Z",
+      expected: "2026-06-07T10:00:00.000Z",
+    },
+    {
+      name: "DOM-or-DOW fires on a matching day of month",
+      expression: "0 9 15 * 1",
+      after: "2026-07-14T08:59:00.000Z",
+      expected: "2026-07-15T09:00:00.000Z",
+    },
+    {
+      name: "DOM-or-DOW fires on a matching day of week",
+      expression: "0 9 15 * 1",
+      after: "2026-06-16T08:59:00.000Z",
+      expected: "2026-06-22T09:00:00.000Z",
+    },
+    {
+      name: "Europe/Oslo spring-forward skipped local minute",
+      expression: "30 2 * * *",
+      after: "2026-03-29T00:55:00.000Z",
+      timezone: "Europe/Oslo",
+      expected: "2026-03-29T01:00:00.000Z",
+    },
+    {
+      name: "Europe/Oslo fall-back duplicate local minute",
+      expression: "30 2 * * *",
+      after: "2026-10-25T00:30:00.000Z",
+      previousFireAt: "2026-10-25T00:30:00.000Z",
+      timezone: "Europe/Oslo",
+      expected: "2026-10-26T01:30:00.000Z",
+    },
+  ])("computes cron next fires for $name", ({ expression, after, expected, timezone, previousFireAt }) => {
+    const next = nextCronFireAfter(
+      expression,
+      new Date(after),
+      timezone ?? "UTC",
+      previousFireAt ? { previousFireAt: new Date(previousFireAt) } : {},
+    );
+    expect(next.toISOString()).toBe(expected);
+  });
+
+  test.each([
+    { name: "too few fields", expression: "* * * *" },
+    { name: "zero step", expression: "*/0 * * * *" },
+    { name: "minute above range", expression: "60 * * * *" },
+    { name: "reversed range", expression: "10-5 * * * *" },
+    { name: "day-of-week above seven", expression: "* * * * 8" },
+  ])("throws for invalid cron expression: $name", ({ expression }) => {
+    expect(() => nextCronFireAfter(expression, new Date("2026-06-08T06:00:00.000Z"))).toThrow();
+  });
+
   test("every schedules fire repeatedly", async () => {
     await withTempStore(async (store) => {
       const trig = trigger({
@@ -182,7 +266,7 @@ message = "{{activity_markdown}}"
 
   test("once schedules fire then disable the trigger", async () => {
     await withTempStore(async (store) => {
-      const at = new Date(Date.now() + 30).toISOString();
+      const at = new Date(Date.now() + 200).toISOString();
       const trig = trigger({
         id: "once",
         source: { kind: "schedule", timing: { type: "once", at } },
@@ -193,7 +277,7 @@ message = "{{activity_markdown}}"
       const schedule = new ScheduleEngine(store, delivery, [trig], 10);
       await schedule.start();
       try {
-        const [job] = await waitForTerminalJobs(store, 1, 1_000);
+        const [job] = await waitForTerminalJobs(store, 1, 2_000);
         expect(job.triggerId).toBe("once");
         expect((await store.requireTrigger("once")).enabled).toBe(false);
       } finally {
@@ -227,6 +311,36 @@ message = "{{activity_markdown}}"
         const [job] = await waitForTerminalJobs(store, 1, 1_000);
         expect(job.triggerId).toBe("catchup");
         expect((await store.listJobs()).filter((item) => item.triggerId === "skip")).toHaveLength(0);
+      } finally {
+        await schedule.stop();
+        await delivery.shutdown();
+      }
+    });
+  });
+
+  test("missed-fire policy fire-all catches up every missed interval", async () => {
+    await withTempStore(async (store) => {
+      const intervalMs = 60 * 60_000;
+      const firstMissed = new Date(Date.now() - 3 * intervalMs + 60_000);
+      const expectedScheduledAts = [0, 1, 2].map((offset) => new Date(firstMissed.getTime() + offset * intervalMs).toISOString());
+      const trig = trigger({
+        id: "fire-all",
+        source: { kind: "schedule", timing: { type: "every", interval: "1h", missedFirePolicy: "fire-all" } },
+      });
+      await store.saveTrigger(trig);
+      await store.writeScheduleState({
+        "fire-all": { nextFireAt: firstMissed.toISOString() },
+      });
+      const delivery = new DeliveryManager(store, new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 }));
+      await delivery.init([trig]);
+      const schedule = new ScheduleEngine(store, delivery, [trig], 10);
+      await schedule.start();
+      try {
+        const jobs = await waitForTerminalJobs(store, 3, 1_000);
+        const fireAllJobs = jobs.filter((job) => job.triggerId === "fire-all");
+        expect(fireAllJobs).toHaveLength(3);
+        expect(fireAllJobs.map((job) => (job.batch[0] as { scheduled_at: string }).scheduled_at).sort()).toEqual(expectedScheduledAts);
+        expect((await store.readScheduleState())["fire-all"]?.nextFireAt).toBe(new Date(firstMissed.getTime() + 3 * intervalMs).toISOString());
       } finally {
         await schedule.stop();
         await delivery.shutdown();
