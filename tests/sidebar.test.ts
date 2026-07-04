@@ -1,4 +1,6 @@
-import { describe, expect, test } from "vitest";
+import { EventEmitter } from "node:events";
+import type { Key } from "node:readline";
+import { describe, expect, test, vi } from "vitest";
 import {
   clampSidebarWidth,
   isSidebarTab,
@@ -14,11 +16,13 @@ import {
   renderRow,
   renderRowLines,
   renderTabBar,
+  runSidebarTui,
   rowsForTab,
   scheduleTimingToForm,
   scheduleNextRunLabel,
   sidebarSignature,
   type SidebarData,
+  type SidebarDeps,
 } from "../src/sidebarTui.js";
 import { fireTriggerNow } from "../src/actions.js";
 import { detectColorLevel, strip } from "../src/ui.js";
@@ -52,6 +56,118 @@ function binding(overrides: Partial<RouterBinding> = {}): RouterBinding {
 
 function data(overrides: Partial<SidebarData> = {}): SidebarData {
   return { triggers: [], active: [], history: [], bindings: [], ...overrides };
+}
+
+class FakeStdin extends EventEmitter {
+  isTTY = true;
+  isRaw = false;
+  rawModes: boolean[] = [];
+  resumed = 0;
+  paused = 0;
+
+  setRawMode(value: boolean): this {
+    this.isRaw = value;
+    this.rawModes.push(value);
+    return this;
+  }
+
+  resume(): this {
+    this.resumed += 1;
+    return this;
+  }
+
+  pause(): this {
+    this.paused += 1;
+    return this;
+  }
+
+  press(value: string, key: Partial<Key> = {}): void {
+    this.emit("keypress", value, {
+      name: key.name ?? value,
+      sequence: value,
+      ctrl: false,
+      meta: false,
+      shift: false,
+      ...key,
+    });
+  }
+}
+
+class FakeStdout extends EventEmitter {
+  isTTY = true;
+  columns = 80;
+  rows = 24;
+  writes: string[] = [];
+
+  write(chunk: string | Uint8Array): boolean {
+    this.writes.push(String(chunk));
+    return true;
+  }
+
+  text(): string {
+    return strip(this.writes.join(""));
+  }
+
+  rawText(): string {
+    return this.writes.join("");
+  }
+}
+
+function fakeTty(): { stdin: FakeStdin; stdout: FakeStdout; tty: SidebarDeps["tty"] } {
+  const stdin = new FakeStdin();
+  const stdout = new FakeStdout();
+  return {
+    stdin,
+    stdout,
+    tty: {
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+    },
+  };
+}
+
+function sidebarDeps(overrides: Partial<SidebarDeps> = {}): SidebarDeps {
+  return {
+    sidebar: false,
+    initialTab: "triggers",
+    loadData: async () => data({ triggers: [trigger({ id: "t1" })] }),
+    renderTriggerPreview: (t) => `trigger ${t.id}`,
+    renderJobPreview: (j) => `job ${j.id}`,
+    renderBindingPreview: (b) => `binding ${b.id}`,
+    runNow: async (t) => `ran ${t.id}`,
+    toggleEnabled: async (t) => `toggled ${t.id}`,
+    cancelJob: async (j) => `cancelled ${j.id}`,
+    saveSchedule: async (t) => `saved ${t.id}`,
+    createTrigger: async (draft) => `created ${draft.name}`,
+    duplicateJob: async (j) => `duplicated ${j.id}`,
+    hiveJump: async (handle) => `jumped ${handle}`,
+    spawnHiveAuthor: async () => "spawned author",
+    ...overrides,
+  };
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 500): Promise<void> {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error(`Timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+async function stopSidebar(stdin: FakeStdin, promise: Promise<void>): Promise<void> {
+  stdin.press("\u001b", { name: "escape" });
+  stdin.press("q", { name: "q" });
+  await promise;
 }
 
 describe("tab model", () => {
@@ -201,6 +317,103 @@ describe("sidebar rendering", () => {
       source: { kind: "schedule", timing: { type: "every", interval: "5m" } },
     });
     expect(scheduleNextRunLabel(sched, {}, now)).toBe("next in 5m");
+  });
+});
+
+describe("runSidebarTui event loop", () => {
+  test("submits the run dialog once while busy and reloads after completion", async () => {
+    const { stdin, stdout, tty } = fakeTty();
+    const calls: string[] = [];
+    const run = deferred<string>();
+    const t = trigger({ id: "t1" });
+    const promise = runSidebarTui(
+      sidebarDeps({
+        tty,
+        loadData: async () => {
+          calls.push("loadData");
+          return data({ triggers: [t] });
+        },
+        runNow: async (selected, payloadJson) => {
+          calls.push(`runNow:${selected.id}:${payloadJson}`);
+          return run.promise;
+        },
+      }),
+    );
+
+    try {
+      await waitUntil(() => stdout.text().includes("t1"), "initial render");
+      stdin.press("r", { name: "r" });
+      await waitUntil(() => stdout.text().includes("run now"), "run dialog render");
+
+      stdin.press("\r", { name: "return" });
+      stdin.press("\r", { name: "return" });
+      await waitUntil(() => calls.filter((call) => call.startsWith("runNow")).length === 1, "single runNow call");
+      expect(calls).toEqual(["loadData", "runNow:t1:{}"]);
+
+      run.resolve("ran t1");
+      await waitUntil(() => calls.length === 3, "reload after run");
+      expect(calls).toEqual(["loadData", "runNow:t1:{}", "loadData"]);
+      expect(stdout.text()).toContain("ran t1");
+    } finally {
+      run.resolve("ran t1");
+      await stopSidebar(stdin, promise);
+    }
+  });
+
+  test("confirms cancellation from the active tab and reloads", async () => {
+    const { stdin, stdout, tty } = fakeTty();
+    const calls: string[] = [];
+    const running = job({ id: "JO.run", status: "running" });
+    const promise = runSidebarTui(
+      sidebarDeps({
+        tty,
+        initialTab: "active",
+        loadData: async () => {
+          calls.push("loadData");
+          return data({ active: [running] });
+        },
+        cancelJob: async (selected) => {
+          calls.push(`cancelJob:${selected.id}`);
+          return `cancelled ${selected.id}`;
+        },
+      }),
+    );
+
+    try {
+      await waitUntil(() => stdout.text().includes("t1"), "active job render");
+      stdin.press("c", { name: "c" });
+      await waitUntil(() => stdout.text().includes("cancel job"), "cancel confirmation render");
+
+      stdin.press("y", { name: "y" });
+      await waitUntil(() => calls.length === 3, "reload after cancel");
+      expect(calls).toEqual(["loadData", "cancelJob:JO.run", "loadData"]);
+      expect(stdout.text()).toContain("cancelled JO.run");
+    } finally {
+      await stopSidebar(stdin, promise);
+    }
+  });
+
+  test("restores the terminal before exiting on SIGTERM", async () => {
+    const { stdin, stdout, tty } = fakeTty();
+    const beforeSigterm = new Set(process.rawListeners("SIGTERM"));
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+    const promise = runSidebarTui(sidebarDeps({ tty }));
+
+    try {
+      await waitUntil(() => stdout.text().includes("t1"), "initial render");
+      const signalListener = process.rawListeners("SIGTERM").find((listener) => !beforeSigterm.has(listener));
+      expect(signalListener).toBeDefined();
+
+      (signalListener as (signal: NodeJS.Signals) => void)("SIGTERM");
+
+      expect(exitSpy).toHaveBeenCalledWith(143);
+      expect(stdin.rawModes).toEqual([true, false]);
+      expect(stdin.paused).toBe(1);
+      expect(stdout.rawText()).toContain("\x1b[?1049l");
+    } finally {
+      exitSpy.mockRestore();
+      await stopSidebar(stdin, promise);
+    }
   });
 });
 
