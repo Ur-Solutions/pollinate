@@ -8,7 +8,11 @@ import { nowIso, parseDuration } from "./time.js";
 import { appendTextLine, daemonLogPath } from "./fsx.js";
 import { gcTemporaryHooks } from "./hooks.js";
 import { gcRouterBindings, routerGcSummary } from "./router-gc.js";
-import type { DaemonConfig, Trigger } from "./types.js";
+import type { DaemonConfig, JobStatus, Trigger } from "./types.js";
+
+const STALE_JOB_RECOVERY_MS = 60_000;
+const TERMINAL_JOB_STATUSES = new Set<JobStatus>(["completed", "errored", "timed-out", "cancelled"]);
+let daemonProcessGuardsInstalled = false;
 
 export class PollinateDaemon {
   private delivery?: DeliveryManager;
@@ -23,11 +27,13 @@ export class PollinateDaemon {
   private bindingGcRunning = false;
   private triggerSignature = "";
   private stopping = false;
+  private daemonConfigSignature = "";
 
   constructor(private readonly store = new PollinateStore()) {}
 
   async start(): Promise<void> {
     await this.store.ensure();
+    const recoveredJobs = await this.recoverStaleJobs();
     const config = await this.store.daemonConfig();
     await gcTemporaryHooks(this.store);
     const triggers = await this.store.loadTriggers();
@@ -37,6 +43,7 @@ export class PollinateDaemon {
       execution: config.execution,
     });
     this.config = config;
+    this.daemonConfigSignature = signatureForConfig(config);
     this.executor = executor;
     this.triggers = triggers;
     this.delivery = new DeliveryManager(this.store, executor);
@@ -60,8 +67,13 @@ export class PollinateDaemon {
       webhook_bind: config.webhook.bind,
       webhook_port: config.webhook.port,
       webhook_relay_enabled: Boolean(config.webhook.relay.secret),
+      recovered_jobs: recoveredJobs,
     });
-    await this.log(`daemon started: ${triggers.length} triggers, webhook ${config.webhook.bind}:${config.webhook.port}, binding gc every ${config.defaults.bindingGcMs}ms`);
+    await this.log(
+      `daemon started: ${triggers.length} triggers, webhook ${config.webhook.bind}:${config.webhook.port}, binding gc every ${config.defaults.bindingGcMs}ms${
+        recoveredJobs ? `, recovered ${recoveredJobs} stale jobs` : ""
+      }`,
+    );
     void this.runBindingGc();
   }
 
@@ -81,6 +93,12 @@ export class PollinateDaemon {
   private async reloadTriggers(): Promise<void> {
     if (this.stopping || !this.delivery || !this.schedule || !this.poll || !this.webhook) return;
     try {
+      const config = await this.store.daemonConfig();
+      const configSignature = signatureForConfig(config);
+      if (configSignature !== this.daemonConfigSignature) {
+        this.daemonConfigSignature = configSignature;
+        await this.log("pollinate.toml changed; restart the daemon to apply webhook, defaults, relay, or execution-profile changes");
+      }
       await gcTemporaryHooks(this.store);
       const triggers = await this.store.loadTriggers();
       const signature = signatureForTriggers(triggers);
@@ -141,6 +159,38 @@ export class PollinateDaemon {
       // Logging must never take the daemon down.
     }
   }
+
+  async logProcessGuard(message: string): Promise<void> {
+    await this.log(`process guard: ${message}`);
+  }
+
+  private async recoverStaleJobs(now = Date.now(), staleMs = STALE_JOB_RECOVERY_MS): Promise<number> {
+    const jobs = await this.store.listJobs();
+    let recovered = 0;
+    for (const job of jobs) {
+      if (TERMINAL_JOB_STATUSES.has(job.status)) continue;
+      const touchedAt = job.startedAt ?? job.queuedAt;
+      const touchedMs = new Date(touchedAt).getTime();
+      if (Number.isFinite(touchedMs) && now - touchedMs < staleMs) continue;
+      const previousStatus = job.status;
+      const error = `daemon restarted mid-execution; marking stale ${previousStatus} job errored`;
+      await this.store.updateJob(job.id, {
+        status: "errored",
+        error,
+        completedAt: nowIso(),
+      });
+      await this.store.appendLedger({
+        event: "pollinate.job.errored",
+        job_id: job.id,
+        trigger_id: job.triggerId,
+        error,
+        recovered_from: previousStatus,
+      });
+      recovered += 1;
+    }
+    if (recovered > 0) await this.log(`recovered ${recovered} stale non-terminal jobs`);
+    return recovered;
+  }
 }
 
 function signatureForTriggers(triggers: Array<{ id: string; updatedAt: string; enabled: boolean }>): string {
@@ -150,8 +200,13 @@ function signatureForTriggers(triggers: Array<{ id: string; updatedAt: string; e
     .join("|");
 }
 
+function signatureForConfig(config: DaemonConfig): string {
+  return JSON.stringify(config);
+}
+
 export async function runForeground(): Promise<void> {
   const daemon = new PollinateDaemon();
+  installDaemonProcessGuards((message) => daemon.logProcessGuard(message));
   await daemon.start();
   const stop = async () => {
     await daemon.stop();
@@ -160,4 +215,23 @@ export async function runForeground(): Promise<void> {
   process.once("SIGINT", () => void stop());
   process.once("SIGTERM", () => void stop());
   await new Promise<void>(() => undefined);
+}
+
+function installDaemonProcessGuards(log: (message: string) => Promise<void>): void {
+  if (daemonProcessGuardsInstalled) return;
+  daemonProcessGuardsInstalled = true;
+  process.on("unhandledRejection", (reason) => {
+    const message = `unhandled rejection: ${formatUnknownError(reason)}`;
+    console.error(`pollinate daemon ${message}`);
+    void log(message).catch(() => undefined);
+  });
+  process.on("uncaughtException", (error) => {
+    const message = `uncaught exception: ${formatUnknownError(error)}`;
+    console.error(`pollinate daemon ${message}`);
+    void log(message).catch(() => undefined);
+  });
+}
+
+function formatUnknownError(error: unknown): string {
+  return error instanceof Error ? error.stack || error.message : String(error);
 }
