@@ -1,18 +1,16 @@
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { readFile } from "node:fs/promises";
 import { describe, expect, test } from "vitest";
 import { installGithubWebhook } from "../src/index.js";
-import { withTempStore } from "./helpers.js";
+import { installCommandStub, withTempStore } from "./helpers.js";
 
 describe("GitHub provider setup", () => {
   test("creates a PR router webhook through gh api", async () => {
     await withTempStore(async (_store, root) => {
-      const bin = join(root, "bin");
-      await mkdir(bin, { recursive: true });
-      const argsLog = join(root, "gh-args.log");
-      const inputLog = join(root, "gh-input.json");
-      await writeFile(
-        join(bin, "gh"),
+      const argsLog = `${root}/gh-args.log`;
+      const inputLog = `${root}/gh-input.json`;
+      const gh = await installCommandStub(
+        root,
+        "gh",
         `#!/bin/sh
 echo "$@" >> "${argsLog}"
 if echo "$@" | grep -q -- "--method GET"; then
@@ -22,10 +20,8 @@ fi
 cat > "${inputLog}"
 printf '{"id":321}'
 `,
+        argsLog,
       );
-      await chmod(join(bin, "gh"), 0o700);
-      const previousPath = process.env.PATH;
-      process.env.PATH = `${bin}:${previousPath ?? ""}`;
       try {
         const result = await installGithubWebhook({
           repo: "trmd/pollinate",
@@ -49,10 +45,9 @@ printf '{"id":321}'
         });
         expect(input.events).toContain("pull_request");
         expect(input.events).toContain("issue_comment");
-        expect(await readFile(argsLog, "utf8")).toContain("repos/trmd/pollinate/hooks");
+        expect(await gh.log()).toContain("repos/trmd/pollinate/hooks");
       } finally {
-        if (previousPath === undefined) delete process.env.PATH;
-        else process.env.PATH = previousPath;
+        gh.restore();
       }
     });
   });

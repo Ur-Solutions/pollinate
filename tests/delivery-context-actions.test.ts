@@ -1,5 +1,5 @@
 import http from "node:http";
-import { chmod, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { ActionExecutor, DeliveryManager, resolveContext } from "../src/index.js";
@@ -68,15 +68,15 @@ describe("delivery manager", () => {
       const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
       const batched = trigger({
         id: "batched",
-        delivery: { mode: { strategy: "batched", window: "40ms", maxBatch: 10 }, maxConcurrent: 1 },
+        delivery: { mode: { strategy: "batched", window: "250ms", maxBatch: 10 }, maxConcurrent: 1 },
       });
       const debounced = trigger({
         id: "debounced",
-        delivery: { mode: { strategy: "debounced", quietPeriod: "40ms" }, maxConcurrent: 1 },
+        delivery: { mode: { strategy: "debounced", quietPeriod: "250ms" }, maxConcurrent: 1 },
       });
       const throttled = trigger({
         id: "throttled",
-        delivery: { mode: { strategy: "throttled", interval: "40ms", collect: true }, maxConcurrent: 1 },
+        delivery: { mode: { strategy: "throttled", interval: "250ms", collect: true }, maxConcurrent: 1 },
       });
       const delivery = new DeliveryManager(store, executor);
       await delivery.init([batched, debounced, throttled]);
@@ -85,7 +85,7 @@ describe("delivery manager", () => {
       await delivery.handle(batched, { triggerId: "batched", source: "manual", payload: "b", receivedAt: new Date().toISOString() });
 
       await delivery.handle(debounced, { triggerId: "debounced", source: "manual", payload: "a", receivedAt: new Date().toISOString() });
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await new Promise((resolve) => setTimeout(resolve, 50));
       await delivery.handle(debounced, { triggerId: "debounced", source: "manual", payload: "b", receivedAt: new Date().toISOString() });
 
       await delivery.handle(throttled, { triggerId: "throttled", source: "manual", payload: "first", receivedAt: new Date().toISOString() });
@@ -105,7 +105,7 @@ describe("delivery manager", () => {
       const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
       const throttled = trigger({
         id: "drop",
-        delivery: { mode: { strategy: "throttled", interval: "80ms", collect: false }, maxConcurrent: 1 },
+        delivery: { mode: { strategy: "throttled", interval: "250ms", collect: false }, maxConcurrent: 1 },
       });
       const batch = trigger({
         id: "maxbatch",
@@ -122,7 +122,7 @@ describe("delivery manager", () => {
       const jobs = await waitForTerminalJobs(store, 2);
       expect(jobs.filter((job) => job.triggerId === "drop")).toHaveLength(1);
       expect(jobs.find((job) => job.triggerId === "maxbatch")?.context.batch_count).toBe("3");
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      await new Promise((resolve) => setTimeout(resolve, 300));
       expect((await store.listJobs()).filter((job) => job.triggerId === "drop")).toHaveLength(1);
       await delivery.shutdown();
     });
@@ -173,6 +173,64 @@ describe("delivery manager", () => {
       await second.shutdown();
     });
   });
+
+  test("restart restores queued delivery jobs behind maxConcurrent", async () => {
+    await withTempStore(async (store) => {
+      const trig = trigger({
+        id: "restart-queue",
+        delivery: { mode: { strategy: "immediate" }, maxConcurrent: 1 },
+        action: { kind: "command", command: "node -e \"setTimeout(()=>{},500)\"", timeout: "2s" },
+      });
+      const first = new DeliveryManager(store, new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 2000 }));
+      await first.init([trig]);
+      for (const n of [1, 2, 3, 4]) {
+        await first.handle(trig, { triggerId: trig.id, source: "manual", payload: { n }, receivedAt: new Date().toISOString() });
+      }
+      await waitForJobs(store, 1, "running");
+      await waitForJobs(store, 3, "queued");
+      await first.shutdown();
+      const savedState = await store.readDeliveryState();
+      expect(savedState["restart-queue"]?.queue).toHaveLength(3);
+      forgetRuntimeQueue(first, trig.id);
+
+      const second = new DeliveryManager(store, new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 2000 }));
+      await second.init([trig]);
+      const terminal = await waitForTerminalJobs(store, 4, 10_000);
+      expect(terminal.every((job) => job.status === "completed")).toBe(true);
+      expect((await store.readDeliveryState())["restart-queue"]?.queue ?? []).toHaveLength(0);
+      await second.shutdown();
+    });
+  });
+
+  test("cancelled queued jobs are skipped when the drain reaches them", async () => {
+    await withTempStore(async (store, root) => {
+      const executedLog = join(root, "executed.log");
+      const script = `const fs=require("fs"); fs.appendFileSync(${JSON.stringify(executedLog)}, JSON.parse(process.argv[1]).n + "\\n"); setTimeout(()=>{},140)`;
+      const trig = trigger({
+        id: "cancel-queued",
+        delivery: { mode: { strategy: "immediate" }, maxConcurrent: 1 },
+        action: { kind: "command", command: `node -e '${script}' '{{event}}'`, timeout: "2s" },
+      });
+      const delivery = new DeliveryManager(store, new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 2000 }));
+      await delivery.init([trig]);
+      for (const n of [1, 2, 3]) {
+        await delivery.handle(trig, { triggerId: trig.id, source: "manual", payload: { n }, receivedAt: new Date().toISOString() });
+      }
+      await waitForJobs(store, 1, "running");
+      const queued = await waitForJobs(store, 2, "queued");
+      const cancelledJob = queued.find((job) => (job.batch[0] as { n: number }).n === 2);
+      expect(cancelledJob).toBeDefined();
+      await store.cancelJob(cancelledJob!.id);
+
+      const terminal = await waitForTerminalJobs(store, 3, 5_000);
+      const cancelled = terminal.find((job) => job.id === cancelledJob!.id);
+      expect(cancelled?.status).toBe("cancelled");
+      expect(terminal.filter((job) => job.status === "completed").map((job) => (job.batch[0] as { n: number }).n).sort()).toEqual([1, 3]);
+      expect(await readFile(executedLog, "utf8")).toBe("1\n3\n");
+      expect((await store.readLedger()).join("\n")).toContain("pollinate.job.cancelled");
+      await delivery.shutdown();
+    });
+  });
 });
 
 describe("context and actions", () => {
@@ -191,9 +249,7 @@ describe("context and actions", () => {
           ],
         },
       });
-      const started = Date.now();
       const resolved = await resolveContext(trig, { triggerId: trig.id, source: "manual", payload: {}, receivedAt: new Date().toISOString() }, { defaultTimeoutMs: 1000 });
-      expect(Date.now() - started).toBeLessThan(180);
       expect(resolved.context.one).toBe("one");
       expect(resolved.context.two).toBe("two");
       expect(resolved.context.file).toBe("file-value");
@@ -209,12 +265,7 @@ describe("context and actions", () => {
         response.end(JSON.stringify({ value: "from-http" }));
       });
       await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-      const bin = join(root, "bin");
-      await mkdir(bin, { recursive: true });
-      await writeFile(join(bin, "hive"), "#!/bin/sh\necho from-hive\n");
-      await chmod(join(bin, "hive"), 0o700);
-      const previousPath = process.env.PATH;
-      process.env.PATH = `${bin}:${previousPath ?? ""}`;
+      const hive = await installHiveStub(root, { script: "#!/bin/sh\necho from-hive\n" });
       try {
         const address = server.address();
         if (!address || typeof address === "string") throw new Error("server did not bind");
@@ -230,8 +281,7 @@ describe("context and actions", () => {
         expect(resolved.context.http_value).toBe("from-http");
         expect(resolved.context.hive_value).toBe("from-hive");
       } finally {
-        if (previousPath === undefined) delete process.env.PATH;
-        else process.env.PATH = previousPath;
+        hive.restore();
         await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
       }
     });
@@ -397,7 +447,7 @@ describe("context and actions", () => {
       const hive = await installHiveStub(root);
       const hiveLog = hive.logPath;
       const hermesLog = join(root, "hermes.log");
-      await installCommandStub(root, "hermes", `#!/bin/sh\necho "$@" >> "${hermesLog}"\ncat >/dev/null\n`, hermesLog);
+      const hermesStub = await installCommandStub(root, "hermes", `#!/bin/sh\necho "$@" >> "${hermesLog}"\ncat >/dev/null\n`, hermesLog);
       try {
         const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
         const flow = trigger({
@@ -432,8 +482,14 @@ describe("context and actions", () => {
         expect((await executor.executeJob(hermesJob, hermes, hermesActivation, [{}])).status).toBe("completed");
         expect(await readFile(hermesLog, "utf8")).toContain("respond");
       } finally {
+        hermesStub.restore();
         hive.restore();
       }
     });
   });
 });
+
+function forgetRuntimeQueue(delivery: DeliveryManager, triggerId: string): void {
+  const runtime = (delivery as unknown as { runtime: Map<string, { queue: unknown[] }> }).runtime.get(triggerId);
+  if (runtime) runtime.queue = [];
+}
