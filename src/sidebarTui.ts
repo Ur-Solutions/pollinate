@@ -178,6 +178,8 @@ export type SidebarDeps = {
   /** Affects footer label only; Enter stays in the TUI for both modes. */
   sidebar: boolean;
   initialTab: SidebarTab;
+  /** Injected for tests; defaults to the process TTY streams. */
+  tty?: { stdin: NodeJS.ReadStream; stdout: NodeJS.WriteStream };
   loadData: () => Promise<SidebarData>;
   /** Poll the persisted active tab so sibling sidebars live-update. */
   syncTab?: () => Promise<SidebarTab | undefined>;
@@ -210,11 +212,11 @@ type Dialog =
   | { kind: "confirm"; title: string; message: string; confirm: () => Promise<string> };
 
 export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+  const stdin = deps.tty?.stdin ?? process.stdin;
+  const stdout = deps.tty?.stdout ?? process.stdout;
+  if (!stdin.isTTY || !stdout.isTTY) {
     throw new Error("pol sidebar requires a TTY. Bind it to a tmux pane or run interactively.");
   }
-  const stdin = process.stdin;
-  const stdout = process.stdout;
   const previousRaw = stdin.isRaw;
 
   let data: SidebarData = await deps.loadData();
