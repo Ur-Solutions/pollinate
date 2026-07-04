@@ -10,6 +10,8 @@ import { nowIso, parseDuration, stableStringify } from "./time.js";
 export class PollEngine {
   private cursors: CursorState = {};
   private timers = new Map<string, NodeJS.Timeout>();
+  private polling = new Map<string, Promise<number>>();
+  private cursorWrite: Promise<void> = Promise.resolve();
   private running = false;
 
   constructor(
@@ -29,7 +31,7 @@ export class PollEngine {
     this.running = false;
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
-    await this.store.writeCursorState(this.cursors);
+    await this.writeCursors();
   }
 
   updateTriggers(triggers: Trigger[]): void {
@@ -38,6 +40,17 @@ export class PollEngine {
   }
 
   async pollNow(trigger: Trigger): Promise<number> {
+    if (trigger.source.kind !== "poll") throw new Error(`Trigger ${trigger.id} is not a poll trigger`);
+    const inFlight = this.polling.get(trigger.id);
+    if (inFlight) return inFlight;
+    const polling = this.runPollNow(trigger).finally(() => {
+      this.polling.delete(trigger.id);
+    });
+    this.polling.set(trigger.id, polling);
+    return polling;
+  }
+
+  private async runPollNow(trigger: Trigger): Promise<number> {
     if (trigger.source.kind !== "poll") throw new Error(`Trigger ${trigger.id} is not a poll trigger`);
     const spec = trigger.source.poll;
     const fetched = await fetchPoll(spec, trigger.cwd, this.execution);
@@ -49,6 +62,8 @@ export class PollEngine {
       new_count: delta.items.length,
       at: nowIso(),
     });
+    this.cursors[trigger.id] = delta.cursors[trigger.id];
+    await this.writeCursors();
     if (delta.items.length > 0) {
       if (spec.emit === "per-item") {
         for (const item of delta.items) {
@@ -59,8 +74,6 @@ export class PollEngine {
       }
       await this.store.appendLedger({ event: "pollinate.poll.detected", trigger_id: trigger.id, item_count: delta.items.length, at: nowIso() });
     }
-    this.cursors = delta.cursors;
-    await this.store.writeCursorState(this.cursors);
     return delta.items.length;
   }
 
@@ -97,8 +110,14 @@ export class PollEngine {
       }
     }
     for (const trigger of active.values()) {
-      if (!this.timers.has(trigger.id)) this.schedule(trigger, 0);
+      if (!this.timers.has(trigger.id) && !this.polling.has(trigger.id)) this.schedule(trigger, 0);
     }
+  }
+
+  private async writeCursors(): Promise<void> {
+    const write = this.cursorWrite.then(() => this.store.writeCursorState(this.cursors));
+    this.cursorWrite = write.catch(() => undefined);
+    await write;
   }
 
   private async dispatch(trigger: Trigger, payload: JsonValue): Promise<void> {
@@ -117,14 +136,31 @@ export async function fetchPoll(spec: PollSpec, cwd?: string, execution?: Execut
     throw error;
   });
   if (spec.fetch.kind === "command") {
-    const result = await execShell(spec.fetch.command, { cwd: spec.fetch.cwd ?? cwd, execution });
+    const timeoutMs = parseDuration(spec.interval);
+    const result = await execShell(spec.fetch.command, { cwd: spec.fetch.cwd ?? cwd, execution, timeoutMs });
+    if (result.timedOut) throw new Error(`poll command timed out after ${timeoutMs}ms`);
     if (result.exitCode !== 0) throw new Error(`poll command exited ${result.exitCode}: ${result.stderr.trim()}`);
     return result.stdout;
   }
-  const response = await fetch(spec.fetch.url, { method: spec.fetch.method ?? "GET", headers: spec.fetch.headers });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`poll HTTP ${response.status}: ${text.slice(0, 200)}`);
-  return text;
+  const timeoutMs = parseDuration(spec.interval);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref();
+  try {
+    const response = await fetch(spec.fetch.url, { method: spec.fetch.method ?? "GET", headers: spec.fetch.headers, signal: controller.signal });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`poll HTTP ${response.status}: ${text.slice(0, 200)}`);
+    return text;
+  } catch (error) {
+    if (isAbortError(error)) throw new Error(`poll HTTP timed out after ${timeoutMs}ms`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "name" in error && (error as { name?: string }).name === "AbortError";
 }
 
 export function detectDelta(
