@@ -131,7 +131,7 @@ async function serviceCommand(command: "start" | "stop" | "restart"): Promise<vo
   throw new Error(`daemon ${command} is not supported on ${platform()}`);
 }
 
-function launchdPlist(): string {
+export function launchdPlist(): string {
   const root = process.env.POLLINATE_STORE_ROOT || join(homedir(), ".pollinate");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -157,7 +157,7 @@ function launchdPlist(): string {
 `;
 }
 
-function systemdUnit(): string {
+export function systemdUnit(): string {
   return `[Unit]
 Description=pollinate trigger daemon
 
