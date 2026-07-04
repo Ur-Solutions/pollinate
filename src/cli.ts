@@ -231,12 +231,13 @@ async function cmdEdit(store: PollinateStore, args: ParsedArgs): Promise<void> {
   const id = requiredArg(args.rest[0], "Usage: pollinate edit <id>");
   await store.requireTrigger(id);
   const editor = process.env.EDITOR || "vi";
+  const path = store.triggerPath(id);
   await new Promise<void>((resolve, reject) => {
-    const child = spawn(editor, [store.triggerPath(id)], { stdio: "inherit" });
+    const child = spawn("/bin/sh", ["-c", `${editor} ${shellQuote(path)}`], { stdio: "inherit" });
     child.on("error", reject);
     child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`${editor} exited ${code}`))));
   });
-  const text = await readFile(store.triggerPath(id), "utf8");
+  const text = await readFile(path, "utf8");
   let edited: Trigger;
   try {
     edited = parseTriggerToml(text, id);
@@ -348,6 +349,8 @@ async function cmdSidebar(store: PollinateStore, args: ParsedArgs): Promise<void
     renderTriggerPreview: (trigger) => renderTrigger(trigger),
     renderJobPreview: (job) => renderJob(job),
     renderBindingPreview: (binding) => renderBinding(binding),
+    // Keep the current dedicated-sidebar behavior until tmux popup focus/size
+    // handling is verified there; the normal full-window TUI still gets popups.
     openPopup: args.flags.sidebar ? undefined : (title, text) => openPreviewPopup(title, text),
     runNow: async (trigger, payloadJson) => {
       const job = await fireTriggerNow(store, trigger, parsePayload(payloadJson));
@@ -394,15 +397,16 @@ async function cmdSidebar(store: PollinateStore, args: ParsedArgs): Promise<void
 }
 
 /**
- * Show rendered text in a centered tmux popup over the whole window (so a preview
- * isn't cramped into the narrow sidebar pane). Returns false outside tmux so the
- * caller can fall back to an in-pane overlay. `less -R` keeps the ANSI colors and
- * closes on `q`; `display-popup -E` then tears the popup down.
+ * Show rendered text in a centered tmux popup for the normal full-window TUI.
+ * The dedicated tmux sidebar pane gates this at the call site pending behavior
+ * verification. Returns false outside tmux so the caller can fall back to an
+ * in-pane overlay. `less -R` keeps the ANSI colors and closes on `q`;
+ * `display-popup -E` then tears the popup down.
  */
 async function openPreviewPopup(title: string, text: string): Promise<boolean> {
   if (!process.env.TMUX) return false;
-  const file = join(tmpdir(), `pol-preview-${process.pid}-${Date.now()}.txt`);
-  await writeFile(file, `${title}\n\n${text}\n`, "utf8");
+  const file = join(tmpdir(), `pol-preview-${process.pid}-${Date.now()}-${randomHookToken()}.txt`);
+  await writeFile(file, `${title}\n\n${text}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
   const q = shellQuote(file);
   // The popup deletes its own file after `less` exits, so cleanup never races
   // `less` — display-popup returns immediately when invoked from within the
@@ -691,7 +695,8 @@ async function cmdHook(store: PollinateStore, args: ParsedArgs): Promise<void> {
 async function cmdHookWait(store: PollinateStore, args: ParsedArgs): Promise<void> {
   const ttl = stringFlag(args, "ttl") ?? "10m";
   const created = await createHookFromArgs(store, args, { defaultTtl: ttl, defaultMaxDeliveries: 1, subjectPrefix: "pollinate.wait" });
-  if (!args.json) console.log(renderHookCreated(created));
+  if (args.json) printJsonLine(hookCreateJson(created));
+  else console.log(renderHookCreated(created));
   const timeoutMs = parseDuration(ttl);
   const deadline = Date.now() + timeoutMs;
   try {
@@ -700,7 +705,9 @@ async function cmdHookWait(store: PollinateStore, args: ParsedArgs): Promise<voi
       const completed = jobs.find((job) => TERMINAL.has(job.status));
       if (completed) {
         await store.removeTrigger(created.trigger.id).catch(() => undefined);
-        print(args, { ...hookCreateJson(created), payload: completed.batch?.[0], job: completed }, `${jobBadge(completed.status)} ${c.bold(created.trigger.id)}`);
+        const result = { ...hookCreateJson(created), payload: completed.batch?.[0], job: completed };
+        if (args.json) printJsonLine(result);
+        else console.log(renderHookWaitResult(created, completed));
         return;
       }
       if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${created.url ?? `/hook/${created.path}`}`);
@@ -710,6 +717,17 @@ async function cmdHookWait(store: PollinateStore, args: ParsedArgs): Promise<voi
     await store.removeTrigger(created.trigger.id).catch(() => undefined);
     throw error;
   }
+}
+
+function renderHookWaitResult(created: HookCreateResult, job: Job): string {
+  const lines = [`${jobBadge(job.status)} ${c.bold(created.trigger.id)}`];
+  const payload = job.batch?.[0];
+  if (payload !== undefined && payload !== null) {
+    lines.push("");
+    lines.push(c.dim("payload"));
+    lines.push(indentBlock(JSON.stringify(payload, null, 2), 2));
+  }
+  return lines.join("\n");
 }
 
 type HookCreateDefaults = {
@@ -1720,22 +1738,133 @@ function parseScalar(value: string): JsonValue {
   return value;
 }
 
+const BOOLEAN_FLAGS = new Set([
+  "json",
+  "sidebar",
+  "toggle-sidebar",
+  "enabled",
+  "disabled",
+  "dry-run",
+  "follow",
+  "foreground",
+  "collect",
+  "force",
+  "install-webhook",
+  "yolo",
+  "no-yolo",
+  "accept-trust",
+  "no-accept-trust",
+]);
+
+const VALUE_FLAGS = new Set([
+  "action",
+  "action-json",
+  "arg",
+  "base-url",
+  "bee",
+  "bee-arg",
+  "bind",
+  "body",
+  "colony",
+  "command",
+  "context-json",
+  "cron",
+  "cursor",
+  "cursor-jsonpath",
+  "cwd",
+  "delivery",
+  "delivery-interval",
+  "delivery-json",
+  "description",
+  "emit",
+  "event",
+  "every",
+  "fetch-command",
+  "fetch-file",
+  "fetch-http",
+  "fetch-method",
+  "filter",
+  "filter-json",
+  "flow",
+  "header",
+  "home",
+  "invoke",
+  "last",
+  "lines",
+  "loop",
+  "max-batch",
+  "max-concurrent",
+  "max-deliveries",
+  "maxBatch",
+  "maxConcurrent",
+  "message",
+  "method",
+  "missed-fire-policy",
+  "n",
+  "name",
+  "once",
+  "path",
+  "payload",
+  "poll-interval",
+  "port",
+  "prompt",
+  "quiet-period",
+  "repo",
+  "review-bee",
+  "reviewer",
+  "router-json",
+  "run",
+  "secret",
+  "sender-human",
+  "source",
+  "source-json",
+  "static",
+  "status",
+  "subject",
+  "tab",
+  "tag",
+  "target",
+  "tier",
+  "timeout",
+  "timezone",
+  "transform",
+  "trigger",
+  "ttl",
+  "url",
+  "width",
+  "window",
+]);
+
+const KNOWN_FLAGS = new Set([...BOOLEAN_FLAGS, ...VALUE_FLAGS]);
+
 function parseArgs(argv: string[]): ParsedArgs {
   const flags: Record<string, string | boolean | string[]> = {};
   const rest: string[] = [];
   let command: string | undefined;
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
+    if (token === "--") {
+      const remaining = argv.slice(index + 1);
+      if (!command && remaining.length) {
+        command = remaining[0];
+        rest.push(...remaining.slice(1));
+      } else {
+        rest.push(...remaining);
+      }
+      break;
+    }
     if (token.startsWith("--")) {
       const raw = token.slice(2);
-      const [key, inline] = raw.split("=", 2);
+      const eq = raw.indexOf("=");
+      const key = eq >= 0 ? raw.slice(0, eq) : raw;
+      const inline = eq >= 0 ? raw.slice(eq + 1) : undefined;
       const value =
         inline ??
         optionalFlagValue(key, argv[index + 1], (value) => {
           index += 1;
           return value;
         }) ??
-        flagValue(key, argv, () => {
+        flagValue(key, () => {
           index += 1;
           return argv[index];
         });
@@ -1749,7 +1878,7 @@ function parseArgs(argv: string[]): ParsedArgs {
           index += 1;
           return value;
         }) ??
-        flagValue(key, argv, () => {
+        flagValue(key, () => {
           index += 1;
           return argv[index];
         });
@@ -1764,32 +1893,27 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 function optionalFlagValue(key: string, next: string | undefined, consume: (value: string) => string): string | boolean | undefined {
   if (key !== "once") return undefined;
-  if (next === undefined || next.startsWith("-")) return true;
+  if (next === undefined || isKnownFlagToken(next)) return true;
   return consume(next);
 }
 
-function flagValue(key: string, argv: string[], consume: () => string): string | boolean {
-  const booleanFlags = new Set([
-    "json",
-    "sidebar",
-    "toggle-sidebar",
-    "enabled",
-    "disabled",
-    "dry-run",
-    "follow",
-    "foreground",
-    "collect",
-    "force",
-    "install-webhook",
-    "yolo",
-    "no-yolo",
-    "accept-trust",
-    "no-accept-trust",
-  ]);
-  if (booleanFlags.has(key)) return true;
+function flagValue(key: string, consume: () => string): string | boolean {
+  if (BOOLEAN_FLAGS.has(key)) return true;
   const value = consume();
-  if (value === undefined || value.startsWith("-")) throw new Error(`--${key} requires a value`);
+  if (value === undefined || isKnownFlagToken(value)) throw new Error(`--${key} requires a value`);
   return value;
+}
+
+function isKnownFlagToken(value: string | undefined): boolean {
+  if (!value || value === "--") return true;
+  if (value.startsWith("--")) {
+    const raw = value.slice(2);
+    const eq = raw.indexOf("=");
+    const key = eq >= 0 ? raw.slice(0, eq) : raw;
+    return KNOWN_FLAGS.has(key);
+  }
+  if (value.startsWith("-") && value.length > 1) return KNOWN_FLAGS.has(value.slice(1));
+  return false;
 }
 
 function addFlag(flags: Record<string, string | boolean | string[]>, key: string, value: string | boolean): void {
@@ -1831,8 +1955,34 @@ function requiredFlag(args: ParsedArgs, key: string, message: string): string {
 }
 
 function print(args: ParsedArgs, jsonValue: unknown, human: string): void {
-  if (args.json) console.log(JSON.stringify(jsonValue, null, 2));
+  if (args.json) console.log(JSON.stringify(redactForJson(jsonValue), null, 2));
   else console.log(human);
+}
+
+function printJsonLine(jsonValue: unknown): void {
+  console.log(JSON.stringify(redactForJson(jsonValue)));
+}
+
+function redactForJson(value: unknown, path: string[] = []): unknown {
+  if (Array.isArray(value)) return value.map((item) => redactForJson(item, path));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+      key,
+      shouldRedactSecret(path, key, item) ? redactSecret(String(item)) : redactForJson(item, [...path, key]),
+    ]),
+  );
+}
+
+function shouldRedactSecret(path: string[], key: string, value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  if (key === "secret" && path.at(-2) === "source" && path.at(-1) === "webhook") return true;
+  if (key === "secret" && path.at(-2) === "webhook" && path.at(-1) === "relay") return true;
+  return key === "relaySecret" || key === "relay_secret";
+}
+
+function redactSecret(value: string): string {
+  return value.startsWith("env:") ? value : "<redacted>";
 }
 
 async function readVersion(): Promise<string> {
