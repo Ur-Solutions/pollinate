@@ -4,8 +4,7 @@
  * Ported from honeybee's `beesSidebar.ts`, with two differences: the strip lives
  * on the RIGHT edge (no `-b`/before flag), and the persisted facet is the active
  * tab rather than a grouping mode. A global `@pol_sidebar_width` option remembers
- * that the operator wants the strip; `syncSidebarLayout` re-materializes it on the
- * active window after focus moves (e.g. a hive jump).
+ * that the operator wants the strip.
  */
 
 import { isAbsolute, resolve } from "node:path";
@@ -174,35 +173,6 @@ export async function toggleSidebar(requestedWidth?: number): Promise<"opened" |
   await removeOtherNavPanes(paneId);
   await tmux(["select-pane", "-t", paneId]);
   return "opened";
-}
-
-/**
- * If the operator previously enabled the sidebar, ensure the active window has a
- * nav strip (idempotent). Called after a hive jump moves focus to a new window.
- */
-export async function syncSidebarLayout(opts: { pruneOthers?: boolean; windowTarget?: string; width?: number } = {}): Promise<string | undefined> {
-  const width = opts.width ?? (await readGlobalSidebarWidth());
-  if (width === undefined) return undefined;
-  let windowTarget = opts.windowTarget;
-  if (!windowTarget) {
-    if (!process.env.TMUX) return undefined;
-    windowTarget = await currentWindowTarget();
-  }
-  const panes = await listWindowPanes(windowTarget);
-  let navPaneId = panes.find((pane) => pane.nav)?.paneId;
-  if (!navPaneId) navPaneId = await openNavPane(windowTarget, width);
-  if (navPaneId) {
-    for (const pane of panes) {
-      if (pane.nav && pane.paneId !== navPaneId) await killPaneBestEffort(pane.paneId);
-    }
-    if (opts.pruneOthers) await removeOtherNavPanes(navPaneId);
-  }
-  return navPaneId;
-}
-
-/** @internal test helper */
-export function __testOnlyExactWindowTarget(windowTarget: string): string {
-  return exactWindowTarget(windowTarget);
 }
 
 /** @internal test helper — builds the split argv without invoking tmux. */

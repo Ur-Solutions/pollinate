@@ -15,11 +15,13 @@ import {
   c,
   jobBadge,
   relativeTime,
+  sourceDetail,
   sourceLabel,
   statusDot,
   strip,
   sym,
   truncate,
+  width as visibleWidth,
 } from "./ui.js";
 import type { Job, RouterBinding, ScheduleState, ScheduleTiming, Trigger } from "./types.js";
 
@@ -319,7 +321,7 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
       };
 
       /** Run an injected side effect, guarding against overlap and reloading after. */
-      const act = async (label: string, fn: () => Promise<string>) => {
+      const act = async (label: string, fn: () => Promise<string>, opts: { closeDialog?: boolean } = {}) => {
         if (busy) return;
         const keepId = currentRow()?.id;
         busy = true;
@@ -329,6 +331,7 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
         try {
           const result = await fn();
           data = await deps.loadData();
+          if (opts.closeDialog) dialog = undefined;
           lastSignature = sidebarSignature(data);
           reslice(keepId);
           setMessage(result);
@@ -521,28 +524,9 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
         render();
       };
 
-      const submitForm = async (form: Extract<Dialog, { kind: "form" }>) => {
-        if (busy) return;
+      const submitForm = (form: Extract<Dialog, { kind: "form" }>) => {
         const values = Object.fromEntries(form.fields.map((f) => [f.key, f.value.trim()]));
-        const keepId = currentRow()?.id;
-        busy = true;
-        loadVersion += 1;
-        setMessage("saving…");
-        render();
-        try {
-          const result = await form.submit(values);
-          data = await deps.loadData();
-          lastSignature = sidebarSignature(data);
-          dialog = undefined;
-          reslice(keepId);
-          setMessage(result);
-        } catch (error) {
-          setMessage(errorMessage(error));
-        } finally {
-          loadVersion += 1;
-          busy = false;
-          if (!done) render();
-        }
+        void act("saving…", () => form.submit(values), { closeDialog: true });
       };
 
       const onDialogKey = (value: string, key: readline.Key) => {
@@ -560,18 +544,7 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
         if (d.kind === "confirm") {
           if (busy) return;
           if (key.name === "y" || key.name === "return" || key.name === "enter") {
-            void (async () => {
-              const keepId = currentRow()?.id;
-              busy = true; loadVersion += 1; setMessage("working…"); render();
-              try {
-                const result = await d.confirm();
-                data = await deps.loadData();
-                lastSignature = sidebarSignature(data);
-                dialog = undefined; reslice(keepId); setMessage(result);
-              } catch (error) {
-                setMessage(errorMessage(error));
-              } finally { loadVersion += 1; busy = false; if (!done) render(); }
-            })();
+            void act("working…", () => d.confirm(), { closeDialog: true });
           } else { dialog = undefined; flash("cancelled"); }
           return;
         }
@@ -579,7 +552,7 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
         if (busy) return;
         if (key.name === "up" || (key.shift && key.name === "tab")) { d.index = (d.index - 1 + d.fields.length) % d.fields.length; render(); return; }
         if (key.name === "down" || key.name === "tab") { d.index = (d.index + 1) % d.fields.length; render(); return; }
-        if (key.name === "return" || key.name === "enter") { void submitForm(d); return; }
+        if (key.name === "return" || key.name === "enter") { submitForm(d); return; }
         const field = d.fields[d.index]!;
         if (key.name === "backspace") { field.value = field.value.slice(0, -1); render(); return; }
         if (value && !key.ctrl && !key.meta && value.length === 1 && value >= " ") { field.value += value; render(); return; }
@@ -730,10 +703,11 @@ export function renderRow(row: SidebarRow, selected: boolean, width: number, sch
 
 export function renderRowLines(row: SidebarRow, selected: boolean, width: number, scheduleState: ScheduleState = {}, now = new Date()): string[] {
   const cursor = selected ? c.accent(sym.bee) : " ";
+  const rowBudget = Math.max(1, width - visibleWidth(`${cursor} `));
   if (row.kind === "trigger") {
     const t = row.trigger;
     const firstPrefix = `${cursor} ${statusDot(t.enabled)} `;
-    const title = c.bold(truncate(t.id, Math.max(8, width - strip(firstPrefix).length)));
+    const title = c.bold(truncate(t.id, Math.max(8, width - visibleWidth(firstPrefix))));
     const infoPrefix = "    ";
     const info = styleTriggerInfo(truncate(triggerInfoText(t, scheduleState, now), Math.max(4, width - infoPrefix.length)), t.source.kind);
     const first = `${firstPrefix}${title}`;
@@ -746,12 +720,19 @@ export function renderRowLines(row: SidebarRow, selected: boolean, width: number
   let body: string;
   if (row.kind === "job") {
     const j = row.job;
-    const handle = row.hiveHandle ? ` ${c.magenta(sym.bee)}` : "";
-    body = `${jobBadge(j.status)} ${c.bold(truncate(j.triggerId, Math.max(8, width - 30)))}${handle} ${c.dim(relativeTime(j.queuedAt))}`;
+    const badge = jobBadge(j.status);
+    const handle = row.hiveHandle ? c.magenta(sym.bee) : "";
+    const queued = c.dim(relativeTime(j.queuedAt, now));
+    const reserved = visibleWidth(`${badge}${handle ? ` ${handle}` : ""} ${queued}`) + 1;
+    body = `${badge} ${c.bold(truncate(j.triggerId, Math.max(4, rowBudget - reserved)))}${handle ? ` ${handle}` : ""} ${queued}`;
   } else {
     const b = row.binding;
-    const handle = b.target?.handle ? ` ${c.magenta(b.target.handle)}` : "";
-    body = `${c.cyan(sym.gear)} ${c.bold(truncate(b.subjectKey, Math.max(8, width - 30)))}${handle} ${c.dim(b.status)}`;
+    const gear = c.cyan(sym.gear);
+    const status = c.dim(truncate(b.status, Math.min(12, Math.max(4, rowBudget))));
+    const handleBudget = b.target?.handle ? Math.min(18, Math.max(4, Math.floor(rowBudget / 3))) : 0;
+    const handle = b.target?.handle ? c.magenta(truncate(b.target.handle, handleBudget)) : "";
+    const reserved = visibleWidth(`${gear}${handle ? ` ${handle}` : ""} ${status}`) + 1;
+    body = `${gear} ${c.bold(truncate(b.subjectKey, Math.max(4, rowBudget - reserved)))}${handle ? ` ${handle}` : ""} ${status}`;
   }
   const line = `${cursor} ${body}`;
   return [clampLine(selected ? c.accent(strip(line)) : line, width)];
@@ -767,11 +748,11 @@ export function scheduleNextRunLabel(trigger: Trigger, scheduleState: ScheduleSt
   if (entry?.completedOnce) return undefined;
   const next = parseNextFire(entry?.nextFireAt) ?? fallbackNextFire(trigger.source.timing, now);
   if (!next) return undefined;
-  return `${next.getTime() <= now.getTime() ? "due" : "next"} ${relativeFrom(next, now)}`;
+  return `${next.getTime() <= now.getTime() ? "due" : "next"} ${relativeTime(next, now)}`;
 }
 
 function triggerInfoText(trigger: Trigger, scheduleState: ScheduleState, now: Date): string {
-  const parts = [trigger.source.kind, sourceDetailText(trigger), scheduleNextRunLabel(trigger, scheduleState, now)]
+  const parts = [trigger.source.kind, sourceDetail(trigger.source), scheduleNextRunLabel(trigger, scheduleState, now)]
     .filter((part): part is string => Boolean(part));
   if (!trigger.enabled) parts.push("disabled");
   if (trigger.tags.length) parts.push(trigger.tags.join(" "));
@@ -782,26 +763,6 @@ function styleTriggerInfo(text: string, kind: string): string {
   if (text === kind) return sourceLabel(kind);
   if (text.startsWith(`${kind} `)) return `${sourceLabel(kind)}${c.dim(text.slice(kind.length))}`;
   return c.dim(text);
-}
-
-function sourceDetailText(trigger: Trigger): string {
-  const source = trigger.source;
-  switch (source.kind) {
-    case "manual":
-      return "on demand";
-    case "schedule": {
-      const timing = source.timing;
-      if (timing.type === "every") return `every ${timing.interval}`;
-      if (timing.type === "cron") return `cron ${timing.expression}${timing.timezone && timing.timezone !== "UTC" ? ` (${timing.timezone})` : ""}`;
-      return `once ${timing.at}`;
-    }
-    case "webhook":
-      return `/hook/${source.webhook.path}${source.webhook.secret ? ` ${sym.mid} secured` : ""}`;
-    case "poll":
-      return `every ${source.poll.interval} ${sym.mid} ${source.poll.fetch.kind}`;
-    default:
-      return "";
-  }
 }
 
 function parseNextFire(value: string | undefined): Date | undefined {
@@ -818,26 +779,6 @@ function fallbackNextFire(timing: ScheduleTiming, now: Date): Date | undefined {
     return at;
   }
   return undefined;
-}
-
-function relativeFrom(then: Date, now: Date): string {
-  const diff = then.getTime() - now.getTime();
-  const future = diff > 0;
-  const abs = Math.abs(diff);
-  if (abs < 1_000) return "now";
-  const units: Array<[number, string]> = [
-    [86_400_000, "d"],
-    [3_600_000, "h"],
-    [60_000, "m"],
-    [1_000, "s"],
-  ];
-  for (const [ms, label] of units) {
-    if (abs >= ms) {
-      const text = `${Math.floor(abs / ms)}${label}`;
-      return future ? `in ${text}` : `${text} ago`;
-    }
-  }
-  return "now";
 }
 
 function blanks(n: number): string[] {
@@ -906,6 +847,5 @@ const HELP_LINES = [
 
 /** Truncate to width while leaving ANSI intact (truncate is ANSI-aware in ui.ts). */
 export function clampLine(line: string, width: number): string {
-  if (strip(line).length <= width) return line;
-  return truncate(strip(line), width);
+  return truncate(line, width);
 }

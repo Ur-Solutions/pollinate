@@ -16,11 +16,6 @@ export type TmuxResult = {
   stderr: string;
 };
 
-/** True when running inside a tmux client/server (the sidebar needs one). */
-export function insideTmux(): boolean {
-  return Boolean(process.env.TMUX);
-}
-
 /**
  * Run `tmux <args>`. By default failures resolve with `ok: false` rather than
  * throwing — tmux probes (list-panes against a window that may not exist) are
