@@ -10,11 +10,19 @@ import { validRelaySignature } from "./satellite.js";
 import { expireTemporaryHook, isExpiredTemporaryHook, recordWebhookDelivery } from "./hooks.js";
 
 const MAX_SEEN_DELIVERIES = 1_000;
+const MAX_REQUEST_BODY_BYTES = 5 * 1024 * 1024;
+const REQUEST_TIMEOUT_MS = 30_000;
+const HEADERS_TIMEOUT_MS = 10_000;
+const MAX_HEADERS_COUNT = 64;
+const ROUTER_BINDING_CAP = 100;
+const ROUTER_CREATION_WINDOW_MS = 60_000;
+const ROUTER_CREATION_LIMIT = 30;
 
 export class WebhookServer {
   private server?: http.Server;
   /** Recently seen webhook delivery GUIDs (`<triggerId>:<x-github-delivery>`), insertion-ordered for eviction. */
   private readonly seenDeliveries = new Set<string>();
+  private readonly routerAdmission = new Map<string, number[]>();
 
   constructor(
     private readonly store: PollinateStore,
@@ -29,6 +37,9 @@ export class WebhookServer {
     this.server = http.createServer((request, response) => {
       void this.handle(request, response);
     });
+    this.server.requestTimeout = REQUEST_TIMEOUT_MS;
+    this.server.headersTimeout = HEADERS_TIMEOUT_MS;
+    this.server.maxHeadersCount = MAX_HEADERS_COUNT;
     await new Promise<void>((resolve, reject) => {
       this.server?.once("error", reject);
       this.server?.listen(this.port, this.bind, () => {
@@ -73,29 +84,34 @@ export class WebhookServer {
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const started = Date.now();
-    if (request.method !== "POST") {
-      send(response, 405, { error: "method not allowed" });
-      return;
-    }
-    const route = webhookRoute(request);
-    if (!route) {
-      send(response, 404, { error: "hook not found" });
-      return;
-    }
-    const { path } = route;
-    const trigger = this.triggers.find((item) => item.enabled && item.source.kind === "webhook" && item.source.webhook.path === path);
-    if (!trigger || trigger.source.kind !== "webhook") {
-      send(response, 404, { error: "hook not found" });
-      return;
-    }
-    if (isExpiredTemporaryHook(trigger)) {
-      const expired = await expireTemporaryHook(this.store, trigger);
-      this.replaceTrigger(expired);
-      send(response, 410, { error: "hook expired" });
-      return;
-    }
-    const raw = await readBody(request);
     try {
+      if (request.method !== "POST") {
+        send(response, 405, { error: "method not allowed" });
+        return;
+      }
+      const route = webhookRoute(request);
+      if (!route) {
+        send(response, 404, { error: "hook not found" });
+        return;
+      }
+      const { path } = route;
+      const trigger = this.triggers.find((item) => item.enabled && item.source.kind === "webhook" && item.source.webhook.path === path);
+      if (!trigger || trigger.source.kind !== "webhook") {
+        send(response, 404, { error: "hook not found" });
+        return;
+      }
+      if (isExpiredTemporaryHook(trigger)) {
+        const expired = await expireTemporaryHook(this.store, trigger);
+        this.replaceTrigger(expired);
+        send(response, 410, { error: "hook expired" });
+        return;
+      }
+      if (requiresSecret(trigger, route, request)) {
+        await this.ledgerRejection(trigger.id, path, "missing-secret", request);
+        send(response, 403, { error: "webhook secret required" });
+        return;
+      }
+      const raw = await readBody(request);
       if (route.kind === "relay") {
         if (!this.relay.secret) {
           await this.ledgerRejection(trigger.id, path, "relay-not-enabled", request);
@@ -108,51 +124,65 @@ export class WebhookServer {
           return;
         }
       }
+      if (requiresSecret(trigger, route, request)) {
+        await this.ledgerRejection(trigger.id, path, "missing-secret", request);
+        send(response, 403, { error: "webhook secret required" });
+        return;
+      }
       if (!validSignature(trigger.source.webhook, raw, request.headers)) {
         await this.ledgerRejection(trigger.id, path, "invalid-signature", request);
         send(response, 403, { error: "invalid signature" });
         return;
       }
-    } catch (error) {
-      send(response, 500, { error: error instanceof Error ? error.message : String(error) });
-      return;
-    }
-    let payload: JsonValue;
-    try {
-      payload = raw.length ? (JSON.parse(raw.toString("utf8")) as JsonValue) : {};
-    } catch {
-      send(response, 400, { error: "invalid json" });
-      return;
-    }
-    const deliveryId = headerValue(request.headers["x-github-delivery"]);
-    if (deliveryId && this.isDuplicateDelivery(trigger.id, deliveryId)) {
-      send(response, 202, { accepted: true, duplicate: true, trigger_id: trigger.id });
+      let payload: JsonValue;
+      try {
+        payload = raw.length ? (JSON.parse(raw.toString("utf8")) as JsonValue) : {};
+      } catch {
+        send(response, 400, { error: "invalid json" });
+        return;
+      }
+      const deliveryId = headerValue(request.headers["x-github-delivery"]);
+      if (deliveryId && this.isDuplicateDelivery(trigger.id, deliveryId)) {
+        send(response, 202, { accepted: true, duplicate: true, trigger_id: trigger.id });
+        await this.store.appendLedger({
+          event: "pollinate.webhook.duplicate",
+          trigger_id: trigger.id,
+          path,
+          delivery_id: deliveryId,
+          source_ip: request.socket.remoteAddress,
+        });
+        return;
+      }
+      if (!(await this.admitRouterDelivery(trigger, path, request, response))) return;
+      const dispatchTrigger = trigger;
+      const transformed = trigger.router ? payload : applyWebhookTransform(trigger.source.webhook, payload);
+      const updated = await recordWebhookDelivery(this.store, trigger);
+      this.replaceTrigger(updated);
+      send(response, 202, { accepted: true, trigger_id: trigger.id });
       await this.store.appendLedger({
-        event: "pollinate.webhook.duplicate",
+        event: "pollinate.webhook.received",
         trigger_id: trigger.id,
         path,
-        delivery_id: deliveryId,
         source_ip: request.socket.remoteAddress,
+        at: nowIso(),
+        response_ms: Date.now() - started,
       });
-      return;
+      void this.dispatch(dispatchTrigger, transformed, request.socket.remoteAddress ?? "unknown", {
+        path,
+        headers: normalizedHeaders(request.headers),
+      }).catch((error) =>
+        this.store.appendLedger({
+          event: "pollinate.webhook.rejected",
+          trigger_id: dispatchTrigger.id,
+          path,
+          reason: "dispatch-error",
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    } catch (error) {
+      const status = error instanceof HttpError ? error.status : 500;
+      send(response, status, { error: error instanceof Error ? error.message : String(error) });
     }
-    const dispatchTrigger = trigger;
-    const transformed = trigger.router ? payload : applyWebhookTransform(trigger.source.webhook, payload);
-    const updated = await recordWebhookDelivery(this.store, trigger);
-    this.replaceTrigger(updated);
-    send(response, 202, { accepted: true, trigger_id: trigger.id });
-    await this.store.appendLedger({
-      event: "pollinate.webhook.received",
-      trigger_id: trigger.id,
-      path,
-      source_ip: request.socket.remoteAddress,
-      at: nowIso(),
-      response_ms: Date.now() - started,
-    });
-    void this.dispatch(dispatchTrigger, transformed, request.socket.remoteAddress ?? "unknown", {
-      path,
-      headers: normalizedHeaders(request.headers),
-    });
   }
 
   private async dispatch(
@@ -190,6 +220,28 @@ export class WebhookServer {
       source_ip: request.socket.remoteAddress,
     });
   }
+
+  private async admitRouterDelivery(trigger: Trigger, path: string, request: IncomingMessage, response: ServerResponse): Promise<boolean> {
+    if (!trigger.router) return true;
+    const bindings = await this.store.listRouterBindings({ triggerId: trigger.id });
+    const openBindings = bindings.filter((binding) => binding.status !== "closed");
+    if (openBindings.length >= ROUTER_BINDING_CAP) {
+      await this.ledgerRejection(trigger.id, path, "router-binding-cap", request);
+      send(response, 429, { error: "router binding cap reached" });
+      return false;
+    }
+    const now = Date.now();
+    const recent = (this.routerAdmission.get(trigger.id) ?? []).filter((at) => now - at < ROUTER_CREATION_WINDOW_MS);
+    if (recent.length >= ROUTER_CREATION_LIMIT) {
+      this.routerAdmission.set(trigger.id, recent);
+      await this.ledgerRejection(trigger.id, path, "router-rate-limited", request);
+      send(response, 429, { error: "router rate limit exceeded" });
+      return false;
+    }
+    recent.push(now);
+    this.routerAdmission.set(trigger.id, recent);
+    return true;
+  }
 }
 
 type WebhookRoute = { kind: "hook" | "relay"; path: string };
@@ -208,7 +260,11 @@ function routePath(pathname: string, prefix: string): string | null {
   if (!pathname.startsWith(marker)) return null;
   const raw = pathname.slice(marker.length);
   if (!raw) return null;
-  return decodeURIComponent(raw).replace(/^\/+/, "");
+  try {
+    return decodeURIComponent(raw).replace(/^\/+/, "");
+  } catch {
+    throw new HttpError(400, "invalid route encoding");
+  }
 }
 
 export function applyWebhookTransform(spec: WebhookSpec, payload: JsonValue): JsonValue {
@@ -266,16 +322,59 @@ function normalizeJsonValue(value: unknown): JsonValue {
   return String(value);
 }
 
-function readBody(request: IncomingMessage): Promise<Buffer> {
+function readBody(request: IncomingMessage, maxBytes = MAX_REQUEST_BODY_BYTES): Promise<Buffer> {
+  const contentLength = headerValue(request.headers["content-length"]);
+  if (contentLength) {
+    const declared = Number(contentLength);
+    if (!Number.isFinite(declared) || declared < 0) throw new HttpError(400, "invalid content-length");
+    if (declared > maxBytes) throw new HttpError(413, "request body too large");
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    request.on("data", (chunk: Buffer) => chunks.push(chunk));
-    request.on("error", reject);
-    request.on("end", () => resolve(Buffer.concat(chunks)));
+    let total = 0;
+    let settled = false;
+    const done = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    request.on("data", (chunk: Buffer | string) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buffer.length;
+      if (total > maxBytes) {
+        done(() => reject(new HttpError(413, "request body too large")));
+        request.destroy();
+        return;
+      }
+      chunks.push(buffer);
+    });
+    request.on("aborted", () => done(() => reject(new HttpError(400, "request aborted"))));
+    request.on("error", (error) => done(() => reject(error)));
+    request.on("end", () => done(() => resolve(Buffer.concat(chunks))));
   });
 }
 
 function send(response: ServerResponse, status: number, body: unknown): void {
+  if (response.destroyed || response.writableEnded) return;
   response.writeHead(status, { "content-type": "application/json" });
   response.end(`${JSON.stringify(body)}\n`);
+}
+
+class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+function requiresSecret(trigger: Trigger, route: WebhookRoute, request: IncomingMessage): boolean {
+  if (trigger.source.kind !== "webhook" || trigger.source.webhook.secret) return false;
+  if (trigger.lifecycle?.temporary) return false;
+  return route.kind === "relay" || !isLoopbackAddress(request.socket.remoteAddress);
+}
+
+function isLoopbackAddress(address: string | undefined): boolean {
+  return Boolean(address && (address === "::1" || address === "::ffff:127.0.0.1" || address.startsWith("127.")));
 }
