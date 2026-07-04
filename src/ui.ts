@@ -5,9 +5,20 @@
 // back to ASCII. The CLI's machine-readable `--json` path never touches this
 // module, so structured output stays byte-stable.
 
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
+import type { Source } from "./types.js";
+
+const ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+const ANSI_AT_RE = /\x1b\[[0-?]*[ -/]*[@-~]/y;
+const EMOJI_RE = /\p{Extended_Pictographic}|\p{Regional_Indicator}/u;
 
 type Stream = NodeJS.WriteStream | { isTTY?: boolean };
+type GraphemeSegment = { segment: string };
+type GraphemeSegmenter = { segment(input: string): Iterable<GraphemeSegment> };
+
+const SegmenterCtor = (Intl as typeof Intl & {
+  Segmenter?: new (locale: string | undefined, options: { granularity: "grapheme" }) => GraphemeSegmenter;
+}).Segmenter;
+const GRAPHEME_SEGMENTER = SegmenterCtor ? new SegmenterCtor(undefined, { granularity: "grapheme" }) : undefined;
 
 export function detectColorLevel(env: NodeJS.ProcessEnv = process.env, stream: Stream = process.stdout): 0 | 1 | 2 | 3 {
   const { FORCE_COLOR, POLLINATE_FORCE_COLOR, NO_COLOR, POLLINATE_NO_COLOR, COLORTERM, TERM, TMUX } = env;
@@ -111,9 +122,77 @@ export const sym = UNICODE
       hline: "-",
     };
 
+function* graphemes(s: string): Iterable<string> {
+  if (GRAPHEME_SEGMENTER) {
+    for (const part of GRAPHEME_SEGMENTER.segment(s)) yield part.segment;
+    return;
+  }
+  yield* Array.from(s);
+}
+
+function isCombining(cp: number): boolean {
+  return (
+    (cp >= 0x0300 && cp <= 0x036f) ||
+    (cp >= 0x0483 && cp <= 0x0489) ||
+    (cp >= 0x0591 && cp <= 0x05bd) ||
+    cp === 0x05bf ||
+    (cp >= 0x05c1 && cp <= 0x05c2) ||
+    (cp >= 0x05c4 && cp <= 0x05c5) ||
+    cp === 0x05c7 ||
+    (cp >= 0x0610 && cp <= 0x061a) ||
+    (cp >= 0x064b && cp <= 0x065f) ||
+    (cp >= 0x0670 && cp <= 0x0670) ||
+    (cp >= 0x06d6 && cp <= 0x06dc) ||
+    (cp >= 0x06df && cp <= 0x06e4) ||
+    (cp >= 0x06e7 && cp <= 0x06e8) ||
+    (cp >= 0x06ea && cp <= 0x06ed) ||
+    (cp >= 0x1ab0 && cp <= 0x1aff) ||
+    (cp >= 0x1dc0 && cp <= 0x1dff) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) ||
+    (cp >= 0xfe20 && cp <= 0xfe2f)
+  );
+}
+
+function isWideCodePoint(cp: number): boolean {
+  return (
+    cp >= 0x1100 &&
+    (cp <= 0x115f ||
+      cp === 0x2329 ||
+      cp === 0x232a ||
+      (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
+      (cp >= 0xac00 && cp <= 0xd7a3) ||
+      (cp >= 0xf900 && cp <= 0xfaff) ||
+      (cp >= 0xfe10 && cp <= 0xfe19) ||
+      (cp >= 0xfe30 && cp <= 0xfe6f) ||
+      (cp >= 0xff00 && cp <= 0xff60) ||
+      (cp >= 0xffe0 && cp <= 0xffe6))
+  );
+}
+
+function codePointWidth(cp: number): number {
+  if (cp === 0 || cp === 0x200d || (cp >= 0xfe00 && cp <= 0xfe0f)) return 0;
+  if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
+  if (isCombining(cp)) return 0;
+  return isWideCodePoint(cp) ? 2 : 1;
+}
+
+function graphemeWidth(segment: string): number {
+  if (EMOJI_RE.test(segment)) return 2;
+  let n = 0;
+  for (const ch of segment) n += codePointWidth(ch.codePointAt(0)!);
+  return n;
+}
+
+function ansiAt(s: string, index: number): string | undefined {
+  ANSI_AT_RE.lastIndex = index;
+  return ANSI_AT_RE.exec(s)?.[0];
+}
+
 /** Visible width of a string, ignoring ANSI escape sequences. */
 export function width(s: string): number {
-  return s.replace(ANSI_RE, "").length;
+  let n = 0;
+  for (const segment of graphemes(strip(s))) n += graphemeWidth(segment);
+  return n;
 }
 
 /** Strip ANSI escape sequences. */
@@ -129,15 +208,41 @@ export function pad(s: string, target: number, align: "left" | "right" = "left")
   return align === "right" ? fill + s : s + fill;
 }
 
-/** Truncate to a visible width, appending an ellipsis. Safe on un-styled text. */
+/** Truncate to a visible width, preserving ANSI escape sequences. */
 export function truncate(s: string, max: number): string {
   if (max <= 0) return "";
   if (width(s) <= max) return s;
-  if (strip(s) !== s) return s; // never truncate mid-escape; styled cells stay intact
-  return s.slice(0, Math.max(0, max - 1)) + (UNICODE ? "…" : "~");
-}
+  const ellipsis = UNICODE ? "…" : "~";
+  const budget = Math.max(0, max - width(ellipsis));
+  let visible = 0;
+  let out = "";
+  let sawAnsi = false;
 
-const terminalWidth = (): number => process.stdout.columns || 80;
+  for (let i = 0; i < s.length;) {
+    const ansi = ansiAt(s, i);
+    if (ansi) {
+      out += ansi;
+      sawAnsi = true;
+      i += ansi.length;
+      continue;
+    }
+
+    const nextAnsi = s.indexOf("\x1b[", i);
+    const plainEnd = nextAnsi >= 0 ? nextAnsi : s.length;
+    const chunk = s.slice(i, plainEnd);
+    for (const segment of graphemes(chunk)) {
+      const segmentWidth = graphemeWidth(segment);
+      if (visible + segmentWidth > budget) {
+        return out + (sawAnsi ? "\x1b[0m" : "") + ellipsis;
+      }
+      out += segment;
+      visible += segmentWidth;
+    }
+    i = plainEnd;
+  }
+
+  return out;
+}
 
 export type TableOptions = {
   head?: string[];
@@ -219,15 +324,6 @@ export function fields(pairs: Array<[string, string] | null | undefined>): strin
   return rows.map(([label, value]) => field(label, value, labelWidth)).join("\n");
 }
 
-/** A horizontal rule spanning the terminal (capped), dimmed. */
-export function rule(label?: string): string {
-  const total = Math.min(terminalWidth(), 80);
-  if (!label) return c.dim(sym.hline.repeat(total));
-  const text = ` ${label} `;
-  const remaining = Math.max(0, total - width(text));
-  return c.dim(sym.hline.repeat(2)) + c.dim(text) + c.dim(sym.hline.repeat(remaining - 2));
-}
-
 /** Enabled/disabled dot for a trigger. */
 export function statusDot(enabled: boolean): string {
   return enabled ? c.green(sym.on) : c.gray(sym.off);
@@ -251,11 +347,6 @@ export function jobBadge(status: string): string {
   return `${look.color(look.glyph)} ${look.color(status)}`;
 }
 
-/** Just the colored status word (for table cells where the glyph is separate). */
-export function jobStatusColor(status: string): (s: string) => string {
-  return (JOB_LOOK[status] ?? { color: c.gray }).color;
-}
-
 const SOURCE_COLOR: Record<string, (s: string) => string> = {
   schedule: c.cyan,
   webhook: c.magenta,
@@ -267,12 +358,31 @@ export function sourceLabel(kind: string): string {
   return (SOURCE_COLOR[kind] ?? c.gray)(kind);
 }
 
+export function sourceDetail(source: Source): string {
+  switch (source.kind) {
+    case "manual":
+      return "on demand";
+    case "schedule": {
+      const timing = source.timing;
+      if (timing.type === "every") return `every ${timing.interval}`;
+      if (timing.type === "cron") return `cron ${timing.expression}${timing.timezone && timing.timezone !== "UTC" ? ` (${timing.timezone})` : ""}`;
+      return `once at ${timing.at}`;
+    }
+    case "webhook":
+      return `/hook/${source.webhook.path}${source.webhook.secret ? ` ${sym.mid} secured` : ""}`;
+    case "poll":
+      return `every ${source.poll.interval} ${sym.mid} ${source.poll.fetch.kind}`;
+    default:
+      return "";
+  }
+}
+
 /** Compact relative time, e.g. "2m ago", "in 3h", "just now". */
-export function relativeTime(iso?: string): string {
+export function relativeTime(iso?: string | Date, now = new Date()): string {
   if (!iso) return c.dim("—");
-  const then = new Date(iso).getTime();
-  if (Number.isNaN(then)) return iso;
-  const diff = Date.now() - then;
+  const then = iso instanceof Date ? iso.getTime() : new Date(iso).getTime();
+  if (Number.isNaN(then)) return iso instanceof Date ? String(iso) : iso;
+  const diff = now.getTime() - then;
   const future = diff < 0;
   const abs = Math.abs(diff);
   if (abs < 1_000) return "just now";
@@ -337,5 +447,3 @@ export function banner(version: string): string {
   const tag = c.dim("trigger substrate");
   return `${mark} ${c.dim(sym.mid)} ${tag} ${c.dim("v" + version)}`;
 }
-
-export const colorEnabled = COLOR;
