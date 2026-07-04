@@ -19,8 +19,11 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "vitest run",
-    "check": "pnpm build && pnpm test"
+    "pretest": "pnpm build",
+    "test": "vitest run --pool threads --no-file-parallelism",
+    "typecheck:tests": "tsc -p tsconfig.tests.json",
+    "lint": "biome check .",
+    "check": "pnpm build && pnpm typecheck:tests && pnpm lint && pnpm test"
   },
   "keywords": [],
   "author": "",
@@ -31,6 +34,7 @@
     "smol-toml": "^1.6.1"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.2",
     "@types/node": "^25.9.2",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"
