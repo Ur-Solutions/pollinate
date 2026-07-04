@@ -7,6 +7,7 @@ export class ScheduleEngine {
   private state: ScheduleState = {};
   private timer?: NodeJS.Timeout;
   private running = false;
+  private ticking = false;
 
   constructor(
     private readonly store: PollinateStore,
@@ -69,26 +70,31 @@ export class ScheduleEngine {
   }
 
   private async tick(): Promise<void> {
-    if (!this.running) return;
-    const now = new Date();
-    for (const trigger of this.scheduleTriggers()) {
-      const timing = trigger.source.kind === "schedule" ? trigger.source.timing : undefined;
-      if (!timing) continue;
-      const entry = this.state[trigger.id] ?? {};
-      if (timing.type === "once" && entry.completedOnce) continue;
-      const nextAt = entry.nextFireAt ? parseIsoDate(entry.nextFireAt, "nextFireAt") : initialNextFire(timing, now);
-      if (!entry.nextFireAt) this.state[trigger.id] = { ...entry, nextFireAt: nextAt.toISOString() };
-      if (nextAt.getTime() <= now.getTime()) {
-        await this.fire(trigger, nextAt);
-        if (timing.type === "once") {
-          this.state[trigger.id] = { ...this.state[trigger.id], completedOnce: true, lastFireAt: nowIso(), nextFireAt: undefined };
-          await this.store.setTriggerEnabled(trigger.id, false);
-          trigger.enabled = false;
-        } else {
-          this.state[trigger.id] = { ...this.state[trigger.id], lastFireAt: nowIso(), nextFireAt: nextFireAfter(timing, now).toISOString() };
+    if (!this.running || this.ticking) return;
+    this.ticking = true;
+    try {
+      const now = new Date();
+      for (const trigger of this.scheduleTriggers()) {
+        const timing = trigger.source.kind === "schedule" ? trigger.source.timing : undefined;
+        if (!timing) continue;
+        const entry = this.state[trigger.id] ?? {};
+        if (timing.type === "once" && entry.completedOnce) continue;
+        const nextAt = entry.nextFireAt ? parseIsoDate(entry.nextFireAt, "nextFireAt") : initialNextFire(timing, now);
+        if (!entry.nextFireAt) this.state[trigger.id] = { ...entry, nextFireAt: nextAt.toISOString() };
+        if (nextAt.getTime() <= now.getTime()) {
+          await this.fire(trigger, nextAt);
+          if (timing.type === "once") {
+            this.state[trigger.id] = { ...this.state[trigger.id], completedOnce: true, lastFireAt: nowIso(), nextFireAt: undefined };
+            await this.store.setTriggerEnabled(trigger.id, false);
+            trigger.enabled = false;
+          } else {
+            this.state[trigger.id] = { ...this.state[trigger.id], lastFireAt: nowIso(), nextFireAt: nextFireAfter(timing, now).toISOString() };
+          }
+          await this.store.writeScheduleState(this.state);
         }
-        await this.store.writeScheduleState(this.state);
       }
+    } finally {
+      this.ticking = false;
     }
   }
 

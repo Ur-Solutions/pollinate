@@ -11,12 +11,17 @@ import {
   formToScheduleTiming,
   jobHiveHandle,
   nextTab,
+  renderRow,
+  renderRowLines,
+  renderTabBar,
   rowsForTab,
   scheduleTimingToForm,
+  scheduleNextRunLabel,
   sidebarSignature,
   type SidebarData,
 } from "../src/sidebarTui.js";
 import { fireTriggerNow } from "../src/actions.js";
+import { detectColorLevel, strip } from "../src/ui.js";
 import type { Job, RouterBinding } from "../src/index.js";
 import { trigger, withTempStore } from "./helpers.js";
 
@@ -140,6 +145,65 @@ describe("filterRows", () => {
   });
 });
 
+describe("sidebar rendering", () => {
+  test("tmux sidebars ignore inherited automation no-color env", () => {
+    const tty = { isTTY: true };
+    expect(detectColorLevel({ NO_COLOR: "1", FORCE_COLOR: "0", TERM: "dumb" } as NodeJS.ProcessEnv, tty)).toBe(0);
+    expect(detectColorLevel({ NO_COLOR: "1", FORCE_COLOR: "0", TERM: "dumb", TMUX: "/tmp/tmux/default,1,0" } as NodeJS.ProcessEnv, tty)).toBe(2);
+    expect(detectColorLevel({ POLLINATE_NO_COLOR: "1", TERM: "tmux-256color", TMUX: "/tmp/tmux/default,1,0" } as NodeJS.ProcessEnv, tty)).toBe(0);
+    expect(detectColorLevel({ POLLINATE_FORCE_COLOR: "0", TERM: "tmux-256color", TMUX: "/tmp/tmux/default,1,0" } as NodeJS.ProcessEnv, tty)).toBe(0);
+  });
+
+  test("active tab uses a visible text marker instead of inverse-video fill", () => {
+    expect(strip(renderTabBar("active", 80))).toContain("[active]");
+  });
+
+  test("schedule rows show the time until the next run inline", () => {
+    const now = new Date("2026-06-23T10:00:00.000Z");
+    const sched = trigger({
+      id: "nightly",
+      source: { kind: "schedule", timing: { type: "every", interval: "5m" } },
+    });
+    const scheduleState = { nightly: { nextFireAt: "2026-06-23T10:07:00.000Z" } };
+    expect(scheduleNextRunLabel(sched, scheduleState, now)).toBe("next in 7m");
+    const row = rowsForTab("triggers", data({ triggers: [sched] }))[0]!;
+    const lines = renderRowLines(row, false, 80, scheduleState, now);
+    expect(lines).toHaveLength(2);
+    expect(strip(lines[0]!)).toContain("nightly");
+    const rendered = strip(renderRow(row, false, 80, scheduleState, now));
+    expect(rendered).toContain("schedule");
+    expect(rendered).toContain("every 5m");
+    expect(rendered).toContain("next in 7m");
+  });
+
+  test("active binding rows are kept to one logical line", () => {
+    const row = rowsForTab(
+      "active",
+      data({
+        bindings: [
+          binding({
+            id: "router.pr",
+            subjectKey: "github:pull_request:Digitech-AS/digitech-next#1596",
+            target: { kind: "hive", handle: "digitech-pr-1596-correctness-with-a-very-long-name" },
+          }),
+        ],
+      }),
+    )[0]!;
+    const lines = renderRowLines(row, true, 44);
+    expect(lines).toHaveLength(1);
+    expect(strip(lines[0]!).length).toBeLessThanOrEqual(44);
+  });
+
+  test("schedule row timing falls back for every schedules before daemon state exists", () => {
+    const now = new Date("2026-06-23T10:00:00.000Z");
+    const sched = trigger({
+      id: "fresh",
+      source: { kind: "schedule", timing: { type: "every", interval: "5m" } },
+    });
+    expect(scheduleNextRunLabel(sched, {}, now)).toBe("next in 5m");
+  });
+});
+
 describe("schedule form round-trip", () => {
   test("every round-trips and validates the duration", () => {
     const form = scheduleTimingToForm({ type: "every", interval: "5m" });
@@ -187,6 +251,27 @@ describe("sidebar pane wiring", () => {
     } finally {
       if (previous === undefined) delete process.env.POL_SIDEBAR_COMMAND;
       else process.env.POL_SIDEBAR_COMMAND = previous;
+    }
+  });
+
+  test("sidebarCommand emits an absolute node invocation, never a bare `pol`", () => {
+    // Regression: a symlinked `pol` bin reports an argv[1] that does not end in
+    // cli.js, which used to fall through to a bare `pol` the tmux server's PATH
+    // could not resolve → the pane died with exit 127.
+    const previousEnv = process.env.POL_SIDEBAR_COMMAND;
+    const previousArgv = process.argv[1];
+    delete process.env.POL_SIDEBAR_COMMAND;
+    process.argv[1] = "/opt/homebrew/bin/pol"; // symlink path, not *.js
+    try {
+      const command = sidebarCommand();
+      expect(command.startsWith(`${process.execPath} `)).toBe(true);
+      expect(command).toContain("/opt/homebrew/bin/pol");
+      expect(command.endsWith(" sidebar --sidebar")).toBe(true);
+      expect(command.startsWith("pol ")).toBe(false);
+    } finally {
+      if (previousEnv === undefined) delete process.env.POL_SIDEBAR_COMMAND;
+      else process.env.POL_SIDEBAR_COMMAND = previousEnv;
+      process.argv[1] = previousArgv;
     }
   });
 });

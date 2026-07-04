@@ -21,7 +21,7 @@ import {
   sym,
   truncate,
 } from "./ui.js";
-import type { Job, RouterBinding, ScheduleTiming, Trigger } from "./types.js";
+import type { Job, RouterBinding, ScheduleState, ScheduleTiming, Trigger } from "./types.js";
 
 const TERMINAL_STATUSES = new Set(["completed", "errored", "timed-out", "cancelled"]);
 
@@ -45,6 +45,8 @@ export type SidebarData = {
   history: Job[];
   /** Router bindings; active/pending ones surface as live hive work. */
   bindings: RouterBinding[];
+  /** Daemon-maintained schedule state, used to show upcoming runs inline. */
+  scheduleState?: ScheduleState;
 };
 
 export type SidebarRow =
@@ -106,7 +108,11 @@ export function sidebarSignature(data: SidebarData): string {
   const a = data.active.map((x) => `${x.id}:${x.status}`).join(",");
   const h = data.history.map((x) => `${x.id}:${x.status}`).join(",");
   const b = data.bindings.map((x) => `${x.id}:${x.status}:${x.target?.handle ?? ""}`).join(",");
-  return `${t}|${a}|${h}|${b}`;
+  const s = Object.entries(data.scheduleState ?? {})
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([id, state]) => `${id}:${state.nextFireAt ?? ""}:${state.completedOnce ? 1 : 0}`)
+    .join(",");
+  return `${t}|${a}|${h}|${b}|${s}`;
 }
 
 export function filterRows(rows: SidebarRow[], query: string): SidebarRow[] {
@@ -184,7 +190,7 @@ export type SidebarDeps = {
   createTrigger: (draft: NewTriggerDraft) => Promise<string>;
   duplicateJob: (job: Job, payloadJson: string) => Promise<string>;
   hiveJump: (handle: string) => Promise<string>;
-  spawnHiveAuthor: (trigger?: Trigger) => Promise<string>;
+  spawnHiveAuthor: (trigger: Trigger | undefined, request: string) => Promise<string>;
 };
 
 type Field = { key: string; label: string; value: string; hint?: string };
@@ -210,20 +216,20 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
   let filtering = false;
   let cursor = 0;
   let scroll = 0;
-  let message = "↑↓ move · ←→ tab · tab previews · n new · r run · e edit · ? help · q quit";
+  let message = "↑↓ move · ←→ tab · tab previews · n new · a author · r run · e edit · ? help · q quit";
   let busy = false;
   let dialog: Dialog | undefined;
 
   readline.emitKeypressEvents(stdin);
   stdin.setRawMode(true);
   stdin.resume();
-  stdout.write("\x1b[?1049h\x1b[?25l");
+  stdout.write("\x1b[?1049h\x1b[?25l\x1b[?7l");
 
   let restored = false;
   const restoreTerminal = () => {
     if (restored) return;
     restored = true;
-    stdout.write("\x1b[?25h\x1b[?1049l");
+    stdout.write("\x1b[?7h\x1b[?25h\x1b[?1049l");
     stdin.setRawMode(previousRaw);
     stdin.pause();
   };
@@ -305,17 +311,30 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
       const openPreview = () => {
         const row = currentRow();
         if (!row) return;
-        const text =
-          row.kind === "trigger" ? deps.renderTriggerPreview(row.trigger)
-          : row.kind === "job" ? deps.renderJobPreview(row.job)
-          : deps.renderBindingPreview(row.binding);
-        const title = row.kind === "trigger" ? row.trigger.id : row.id;
+        let text: string;
+        let title: string;
+        try {
+          text =
+            row.kind === "trigger" ? deps.renderTriggerPreview(row.trigger)
+            : row.kind === "job" ? deps.renderJobPreview(row.job)
+            : deps.renderBindingPreview(row.binding);
+          title = row.kind === "trigger" ? row.trigger.id : row.id;
+        } catch (error) {
+          flash(`preview failed: ${error instanceof Error ? error.message : String(error)}`);
+          return;
+        }
         if (deps.openPopup) {
           // Centered popup over the whole window; blocks until the operator closes it.
           message = `preview: ${title}`;
           render();
-          void deps
-            .openPopup(title, text)
+          let popup: Promise<boolean>;
+          try {
+            popup = deps.openPopup(title, text);
+          } catch (error) {
+            flash(error instanceof Error ? error.message : String(error));
+            return;
+          }
+          void popup
             .then((shown) => {
               if (done) return;
               if (!shown) dialog = { kind: "preview", title, lines: text.split("\n"), scroll: 0 };
@@ -447,10 +466,25 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
         void act(`jumping to ${handle}…`, () => deps.hiveJump(handle));
       };
 
-      const doSpawnHiveAuthor = () => {
+      const openAuthor = () => {
         const row = currentRow();
         const trigger = row?.kind === "trigger" ? row.trigger : undefined;
-        void act("spawning hive authoring session…", () => deps.spawnHiveAuthor(trigger));
+        dialog = {
+          kind: "form",
+          title: trigger ? `author trigger · ${trigger.id}` : "author trigger",
+          footer: trigger ? "selected trigger is provided as context" : "describe the trigger you want",
+          index: 0,
+          fields: [
+            {
+              key: "request",
+              label: "request",
+              value: trigger ? `Improve ${trigger.id}` : "",
+              hint: "what should the Hive session create or change?",
+            },
+          ],
+          submit: async (values) => deps.spawnHiveAuthor(trigger, values.request),
+        };
+        render();
       };
 
       const submitForm = async (form: Extract<Dialog, { kind: "form" }>) => {
@@ -534,7 +568,7 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
         if (value === "d") { openDuplicate(); return; }
         if (value === "t") { doToggle(); return; }
         if (value === "c") { doCancel(); return; }
-        if (value === "H") { doSpawnHiveAuthor(); return; }
+        if (value === "a" || value === "H") { openAuthor(); return; }
       };
 
       const render = () => {
@@ -546,16 +580,22 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
         if (dialog) {
           lines.push(...renderDialog(dialog, width, bodyRows));
         } else {
+          const rowSlots = visibleRowSlots(tab, bodyRows);
           if (cursor < scroll) scroll = cursor;
-          if (cursor >= scroll + bodyRows) scroll = cursor - bodyRows + 1;
-          scroll = Math.min(scroll, Math.max(0, rows.length - bodyRows));
+          if (cursor >= scroll + rowSlots) scroll = cursor - rowSlots + 1;
+          scroll = Math.min(scroll, Math.max(0, rows.length - rowSlots));
+          const now = new Date();
           if (rows.length === 0) {
             lines.push(c.dim(tab === "triggers" ? "  no triggers — press n to create one" : tab === "active" ? "  no active jobs" : "  no history yet"));
             for (let i = 1; i < bodyRows; i += 1) lines.push("");
           } else {
-            const visible = rows.slice(scroll, scroll + bodyRows);
-            for (let i = 0; i < visible.length; i += 1) lines.push(renderRow(visible[i]!, scroll + i === cursor, width));
-            for (let i = visible.length; i < bodyRows; i += 1) lines.push("");
+            const visible = rows.slice(scroll, scroll + rowSlots);
+            const renderedRows: string[] = [];
+            for (let i = 0; i < visible.length; i += 1) {
+              renderedRows.push(...renderRowLines(visible[i]!, scroll + i === cursor, width, data.scheduleState ?? {}, now));
+            }
+            lines.push(...renderedRows.slice(0, bodyRows));
+            for (let i = renderedRows.length; i < bodyRows; i += 1) lines.push("");
           }
         }
         lines.push(truncate(filtering ? c.cyan(`/${query}`) : message, width));
@@ -568,7 +608,7 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
         if (dialog?.kind === "confirm") return "y confirm · n/esc cancel";
         if (dialog) return "↑↓ scroll · q/esc close";
         if (filtering) return "type to filter · enter apply · esc clear";
-        return `${deps.sidebar ? "sidebar" : "picker"} · tab preview · enter hive · n e r d t c H · / filter`;
+        return `${deps.sidebar ? "sidebar" : "picker"} · tab preview · enter hive · n a e r d t c · / filter`;
       };
 
       const onResize = () => render();
@@ -593,6 +633,9 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
             reslice();
             render();
           });
+        }
+        if (!dialog && !busy && tab === "triggers" && rows.some((row) => row.kind === "trigger" && row.trigger.source.kind === "schedule")) {
+          render();
         }
         if (tick % 2 === 0 && !refreshing) {
           refreshing = true;
@@ -622,22 +665,36 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
 
 // --- rendering -------------------------------------------------------------
 
-function renderTabBar(active: SidebarTab, width: number): string {
+export function renderTabBar(active: SidebarTab, width: number): string {
   const cells = SIDEBAR_TABS.map((tab) => {
-    const label = ` ${TAB_LABEL[tab]} `;
-    return tab === active ? c.inverse(c.bold(label)) : c.dim(label);
+    const label = TAB_LABEL[tab];
+    return tab === active ? c.accent(c.bold(`[${label}]`)) : c.dim(` ${label} `);
   });
   const head = `${c.accent(sym.flower)} ${c.bold("pollinate")}`;
   return truncate(`${head}  ${cells.join(c.dim("·"))}`, width);
 }
 
-function renderRow(row: SidebarRow, selected: boolean, width: number): string {
+export function renderRow(row: SidebarRow, selected: boolean, width: number, scheduleState: ScheduleState = {}, now = new Date()): string {
+  return renderRowLines(row, selected, width, scheduleState, now).join("\n");
+}
+
+export function renderRowLines(row: SidebarRow, selected: boolean, width: number, scheduleState: ScheduleState = {}, now = new Date()): string[] {
   const cursor = selected ? c.accent(sym.bee) : " ";
-  let body: string;
   if (row.kind === "trigger") {
     const t = row.trigger;
-    body = `${statusDot(t.enabled)} ${c.bold(truncate(t.id, Math.max(8, width - 28)))} ${c.dim(sym.mid)} ${sourceLabel(t.source.kind)}`;
-  } else if (row.kind === "job") {
+    const firstPrefix = `${cursor} ${statusDot(t.enabled)} `;
+    const title = c.bold(truncate(t.id, Math.max(8, width - strip(firstPrefix).length)));
+    const infoPrefix = "    ";
+    const info = styleTriggerInfo(truncate(triggerInfoText(t, scheduleState, now), Math.max(4, width - infoPrefix.length)), t.source.kind);
+    const first = `${firstPrefix}${title}`;
+    const second = `${infoPrefix}${info}`;
+    return [
+      clampLine(selected ? c.accent(strip(first)) : first, width),
+      clampLine(selected ? c.accent(strip(second)) : second, width),
+    ];
+  }
+  let body: string;
+  if (row.kind === "job") {
     const j = row.job;
     const handle = row.hiveHandle ? ` ${c.magenta(sym.bee)}` : "";
     body = `${jobBadge(j.status)} ${c.bold(truncate(j.triggerId, Math.max(8, width - 30)))}${handle} ${c.dim(relativeTime(j.queuedAt))}`;
@@ -647,7 +704,90 @@ function renderRow(row: SidebarRow, selected: boolean, width: number): string {
     body = `${c.cyan(sym.gear)} ${c.bold(truncate(b.subjectKey, Math.max(8, width - 30)))}${handle} ${c.dim(b.status)}`;
   }
   const line = `${cursor} ${body}`;
-  return selected ? c.accent(strip(line)) : line;
+  return [clampLine(selected ? c.accent(strip(line)) : line, width)];
+}
+
+function visibleRowSlots(tab: SidebarTab, bodyRows: number): number {
+  return tab === "triggers" ? Math.max(1, Math.floor(bodyRows / 2)) : bodyRows;
+}
+
+export function scheduleNextRunLabel(trigger: Trigger, scheduleState: ScheduleState = {}, now = new Date()): string | undefined {
+  if (trigger.source.kind !== "schedule" || !trigger.enabled) return undefined;
+  const entry = scheduleState[trigger.id];
+  if (entry?.completedOnce) return undefined;
+  const next = parseNextFire(entry?.nextFireAt) ?? fallbackNextFire(trigger.source.timing, now);
+  if (!next) return undefined;
+  return `${next.getTime() <= now.getTime() ? "due" : "next"} ${relativeFrom(next, now)}`;
+}
+
+function triggerInfoText(trigger: Trigger, scheduleState: ScheduleState, now: Date): string {
+  const parts = [trigger.source.kind, sourceDetailText(trigger), scheduleNextRunLabel(trigger, scheduleState, now)]
+    .filter((part): part is string => Boolean(part));
+  if (!trigger.enabled) parts.push("disabled");
+  if (trigger.tags.length) parts.push(trigger.tags.join(" "));
+  return parts.join(` ${sym.mid} `);
+}
+
+function styleTriggerInfo(text: string, kind: string): string {
+  if (text === kind) return sourceLabel(kind);
+  if (text.startsWith(`${kind} `)) return `${sourceLabel(kind)}${c.dim(text.slice(kind.length))}`;
+  return c.dim(text);
+}
+
+function sourceDetailText(trigger: Trigger): string {
+  const source = trigger.source;
+  switch (source.kind) {
+    case "manual":
+      return "on demand";
+    case "schedule": {
+      const timing = source.timing;
+      if (timing.type === "every") return `every ${timing.interval}`;
+      if (timing.type === "cron") return `cron ${timing.expression}${timing.timezone && timing.timezone !== "UTC" ? ` (${timing.timezone})` : ""}`;
+      return `once ${timing.at}`;
+    }
+    case "webhook":
+      return `/hook/${source.webhook.path}${source.webhook.secret ? ` ${sym.mid} secured` : ""}`;
+    case "poll":
+      return `every ${source.poll.interval} ${sym.mid} ${source.poll.fetch.kind}`;
+    default:
+      return "";
+  }
+}
+
+function parseNextFire(value: string | undefined): Date | undefined {
+  if (!value) return undefined;
+  const next = new Date(value);
+  return Number.isNaN(next.getTime()) ? undefined : next;
+}
+
+function fallbackNextFire(timing: ScheduleTiming, now: Date): Date | undefined {
+  if (timing.type === "every") return new Date(now.getTime() + parseDuration(timing.interval));
+  if (timing.type === "once") {
+    const at = new Date(timing.at);
+    if (Number.isNaN(at.getTime()) || at.getTime() <= now.getTime()) return undefined;
+    return at;
+  }
+  return undefined;
+}
+
+function relativeFrom(then: Date, now: Date): string {
+  const diff = then.getTime() - now.getTime();
+  const future = diff > 0;
+  const abs = Math.abs(diff);
+  if (abs < 1_000) return "now";
+  const units: Array<[number, string]> = [
+    [86_400_000, "d"],
+    [3_600_000, "h"],
+    [60_000, "m"],
+    [1_000, "s"],
+  ];
+  for (const [ms, label] of units) {
+    if (abs >= ms) {
+      const text = `${Math.floor(abs / ms)}${label}`;
+      return future ? `in ${text}` : `${text} ago`;
+    }
+  }
+  return "now";
 }
 
 function blanks(n: number): string[] {
@@ -661,8 +801,9 @@ function renderDialog(dialog: Dialog, width: number, bodyRows: number): string[]
     return [head, ...window, ...blanks(bodyRows - 1 - window.length)];
   }
   if (dialog.kind === "help") {
-    const window = HELP_LINES.slice(dialog.scroll, dialog.scroll + bodyRows - 1);
-    return [c.bold("keys"), ...window, ...blanks(bodyRows - 1 - window.length)];
+    const head = `${c.accent(sym.flower)} ${c.bold("keyboard shortcuts")}`;
+    const window = HELP_LINES.slice(dialog.scroll, dialog.scroll + bodyRows - 2);
+    return [head, c.dim("q/esc closes this dialog"), ...window, ...blanks(bodyRows - 2 - window.length)];
   }
   if (dialog.kind === "confirm") {
     return [`${c.yellow(sym.warn)} ${c.bold(dialog.title)}`, "", `  ${dialog.message}`, ...blanks(bodyRows - 3)];
@@ -681,22 +822,34 @@ function renderDialog(dialog: Dialog, width: number, bodyRows: number): string[]
 }
 
 const HELP_LINES = [
-  "↑/↓ or j/k   move cursor",
-  "←/→          switch tab (triggers/active/history)",
-  "tab          preview the highlighted row",
-  "enter        jump to the row's hive bee (or preview a trigger)",
-  "n            new trigger (form)",
-  "e            edit schedule (form)",
-  "r            run now (fire a trigger with a payload)",
-  "d            duplicate a job and re-fire with an edited payload",
-  "t            toggle a trigger enabled/disabled",
-  "c            cancel a running job",
-  "H            spawn a hive session to author a trigger",
-  "/            filter rows (enter applies, esc clears)",
-  "?            this help · q/esc closes / quits",
+  "",
+  "Navigation",
+  "  ↑/↓ or j/k     move cursor",
+  "  ←/→            switch tab",
+  "  shift+tab      previous tab",
+  "  q or esc       quit sidebar",
+  "",
+  "Rows",
+  "  tab            preview highlighted row",
+  "  enter          open row hive target; previews triggers",
+  "  n              create trigger",
+  "  e              edit selected schedule",
+  "  r              run selected trigger now",
+  "  d              duplicate selected job",
+  "  t              toggle selected trigger",
+  "  c              cancel selected job",
+  "  a              author a trigger with Hive",
+  "  H              author alias",
+  "",
+  "Search And Dialogs",
+  "  /              filter rows",
+  "  enter          apply filter or submit form",
+  "  esc            clear filter or close dialog",
+  "  ?              show this shortcuts dialog",
 ];
 
 /** Truncate to width while leaving ANSI intact (truncate is ANSI-aware in ui.ts). */
-function clampLine(line: string, width: number): string {
-  return truncate(line, width);
+export function clampLine(line: string, width: number): string {
+  if (strip(line).length <= width) return line;
+  return truncate(strip(line), width);
 }

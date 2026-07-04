@@ -315,16 +315,18 @@ async function cmdSidebar(store: PollinateStore, args: ParsedArgs): Promise<void
   }
 
   const loadData = async (): Promise<SidebarData> => {
-    const [triggers, recent, bindings] = await Promise.all([
+    const [triggers, recent, bindings, scheduleState] = await Promise.all([
       store.loadTriggers(),
       store.listJobs({ last: 300 }),
       store.listRouterBindings(),
+      store.readScheduleState(),
     ]);
     return {
       triggers,
       active: recent.filter((job) => !TERMINAL.has(job.status)),
       history: recent.filter((job) => TERMINAL.has(job.status)).slice(0, 100),
       bindings,
+      scheduleState,
     };
   };
 
@@ -346,7 +348,7 @@ async function cmdSidebar(store: PollinateStore, args: ParsedArgs): Promise<void
     renderTriggerPreview: (trigger) => renderTrigger(trigger),
     renderJobPreview: (job) => renderJob(job),
     renderBindingPreview: (binding) => renderBinding(binding),
-    openPopup: (title, text) => openPreviewPopup(title, text),
+    openPopup: args.flags.sidebar ? undefined : (title, text) => openPreviewPopup(title, text),
     runNow: async (trigger, payloadJson) => {
       const job = await fireTriggerNow(store, trigger, parsePayload(payloadJson));
       return `${jobBadge(job.status)} ${shortId(job.id)}`;
@@ -379,9 +381,9 @@ async function cmdSidebar(store: PollinateStore, args: ParsedArgs): Promise<void
       if (result.exitCode !== 0) throw new Error(`hive open ${handle}: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
       return `opened ${handle}`;
     },
-    spawnHiveAuthor: async (trigger) => {
+    spawnHiveAuthor: async (trigger, request) => {
       const cwd = trigger?.cwd ?? process.cwd();
-      const prompt = hiveAuthorPrompt(trigger);
+      const prompt = hiveAuthorPrompt(trigger, request);
       const result = await execArgv("hive", ["x", "codex", prompt], { cwd, timeoutMs: 30_000 });
       if (result.exitCode !== 0) throw new Error(`hive x: ${result.stderr.trim() || `exit ${result.exitCode}`}`);
       const handle = parseHiveHandle(result.stdout);
@@ -445,11 +447,25 @@ function triggerFromDraft(draft: NewTriggerDraft): Trigger {
   };
 }
 
-function hiveAuthorPrompt(trigger?: Trigger): string {
-  const base =
-    "Help me author a Pollinate trigger. Pollinate (`pol`) is a trigger substrate; triggers are TOML files created with `pol create`/`pol add`. " +
-    "Read its trigger TOML schema (run `pol --help` and check the project's AGENTS.md), then propose and create a trigger with me.";
-  return trigger ? `${base} Use the existing trigger "${trigger.id}" as a starting point.` : base;
+function hiveAuthorPrompt(trigger: Trigger | undefined, request: string): string {
+  const trimmed = request.trim();
+  const base = [
+    "Help me author a Pollinate trigger.",
+    "Pollinate (`pol`) is a trigger substrate; triggers are TOML files managed with `pol create`, `pol add`, `pol get`, and `pol edit`.",
+    "Read the trigger schema in this repo's AGENTS.md and inspect current triggers before changing anything.",
+    "Important: `pol add` and `pol create` overwrite triggers with the same id, so check `pol get <id>` first.",
+  ].join(" ");
+  const context = trigger
+    ? [
+        `Selected trigger: ${trigger.id}.`,
+        `Working directory: ${trigger.cwd ?? process.cwd()}.`,
+        "Use that trigger as the starting point unless the operator request clearly asks for a new trigger.",
+      ].join(" ")
+    : "No trigger is selected; help design a new trigger unless the operator request says otherwise.";
+  const goal = trimmed
+    ? `Operator request:\n${trimmed}`
+    : "Operator request:\nAsk a short clarifying question first, then propose the smallest useful trigger change.";
+  return `${base}\n\n${context}\n\n${goal}`;
 }
 
 function renderSidebarSnapshot(data: SidebarData): string {

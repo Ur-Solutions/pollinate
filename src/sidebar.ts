@@ -8,6 +8,8 @@
  * active window after focus moves (e.g. a hive jump).
  */
 
+import { isAbsolute, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { formatShellCommand, tmux } from "./tmux.js";
 
 export const SIDEBAR_NAV_PANE_OPTION = "@pol_sidebar_nav";
@@ -108,14 +110,28 @@ export async function writeSidebarTab(tab: SidebarTab): Promise<void> {
   await tmux(["set-option", "-g", SIDEBAR_TAB_OPTION, tab]);
 }
 
-/** Resolve the command a sidebar pane runs. Env override wins for tests/dev. */
+/**
+ * Resolve the command a sidebar pane runs. Env override wins for tests/dev.
+ *
+ * tmux spawns the pane through `/bin/sh -c` using the tmux *server's* PATH, which
+ * frequently lacks the npm/pnpm global bin dir (or any node shim). A bare `pol`
+ * there is "command not found" → the pane dies with exit 127. So we always emit
+ * an absolute `node <script>` invocation: `process.execPath` is the absolute node
+ * binary, and the script is resolved to an absolute path. When `pol` is installed
+ * its bin is a symlink — `process.argv[1]` is that symlink's (absolute) path, and
+ * node happily follows it to the real `cli.js`.
+ */
 export function sidebarCommand(): string {
   if (process.env.POL_SIDEBAR_COMMAND) return process.env.POL_SIDEBAR_COMMAND;
+  return formatShellCommand([process.execPath, cliEntryPath(), "sidebar", "--sidebar"]);
+}
+
+/** Absolute path to the CLI entry, robust to relative argv and symlinked bins. */
+function cliEntryPath(): string {
   const argv0 = process.argv[1];
-  if (argv0 && (argv0.endsWith("cli.ts") || argv0.endsWith("cli.js"))) {
-    return formatShellCommand([process.execPath, argv0, "sidebar", "--sidebar"]);
-  }
-  return formatShellCommand(["pol", "sidebar", "--sidebar"]);
+  if (argv0) return isAbsolute(argv0) ? argv0 : resolve(process.cwd(), argv0);
+  // No entry script (e.g. `node -e`): fall back to this module's sibling cli.js.
+  return fileURLToPath(new URL("./cli.js", import.meta.url));
 }
 
 async function killPaneBestEffort(paneId: string): Promise<void> {

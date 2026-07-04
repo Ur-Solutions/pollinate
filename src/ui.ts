@@ -7,19 +7,28 @@
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;
 
-function detectColorLevel(): 0 | 1 | 2 | 3 {
-  const { FORCE_COLOR, NO_COLOR, COLORTERM, TERM } = process.env;
-  if (FORCE_COLOR !== undefined) {
-    if (FORCE_COLOR === "" || FORCE_COLOR === "0" || FORCE_COLOR === "false") return 0;
-    if (FORCE_COLOR === "1") return 1;
-    if (FORCE_COLOR === "2") return 2;
-    return 3;
+type Stream = NodeJS.WriteStream | { isTTY?: boolean };
+
+export function detectColorLevel(env: NodeJS.ProcessEnv = process.env, stream: Stream = process.stdout): 0 | 1 | 2 | 3 {
+  const { FORCE_COLOR, POLLINATE_FORCE_COLOR, NO_COLOR, POLLINATE_NO_COLOR, COLORTERM, TERM, TMUX } = env;
+  const forced = POLLINATE_FORCE_COLOR ?? FORCE_COLOR;
+  if (forced !== undefined) {
+    if (forced === "" || forced === "0" || forced === "false") {
+      if (POLLINATE_FORCE_COLOR !== undefined || !TMUX) return 0;
+    } else if (forced === "1") return 1;
+    else if (forced === "2") return 2;
+    else return 3;
   }
-  if (NO_COLOR !== undefined && NO_COLOR !== "") return 0;
-  if (!process.stdout.isTTY) return 0;
-  if (TERM === "dumb") return 0;
+  if (POLLINATE_NO_COLOR !== undefined && POLLINATE_NO_COLOR !== "") return 0;
+  // NO_COLOR often leaks from non-interactive Codex/tooling parents into tmux.
+  // Keep honoring it outside tmux; inside tmux use POLLINATE_NO_COLOR for an
+  // intentional no-color override.
+  if (!TMUX && NO_COLOR !== undefined && NO_COLOR !== "") return 0;
+  if (!stream.isTTY) return 0;
+  if (!TMUX && TERM === "dumb") return 0;
   if (COLORTERM && /truecolor|24bit/i.test(COLORTERM)) return 3;
   if (TERM && /256|truecolor/i.test(TERM)) return 2;
+  if (TMUX) return 2;
   return 1;
 }
 
