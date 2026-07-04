@@ -136,19 +136,25 @@ export function scheduleTimingToForm(timing: ScheduleTiming | undefined): Schedu
   };
 }
 
-export function formToScheduleTiming(values: ScheduleFormValues): ScheduleTiming {
+export function formToScheduleTiming(values: ScheduleFormValues, previous?: ScheduleTiming): ScheduleTiming {
   const type = values.type.trim();
+  const missedFirePolicy = previous?.missedFirePolicy ? { missedFirePolicy: previous.missedFirePolicy } : {};
   if (type === "every") {
     parseDuration(values.interval.trim()); // throws on a bad duration
-    return { type: "every", interval: values.interval.trim() };
+    return { type: "every", interval: values.interval.trim(), ...missedFirePolicy };
   }
   if (type === "once") {
     if (Number.isNaN(Date.parse(values.at.trim()))) throw new Error(`Invalid ISO date: ${values.at}`);
-    return { type: "once", at: values.at.trim() };
+    return { type: "once", at: values.at.trim(), ...missedFirePolicy };
   }
   if (type === "cron") {
     if (!values.expression.trim()) throw new Error("cron expression is required");
-    return { type: "cron", expression: values.expression.trim(), ...(values.timezone.trim() ? { timezone: values.timezone.trim() } : {}) };
+    return {
+      type: "cron",
+      expression: values.expression.trim(),
+      ...(values.timezone.trim() ? { timezone: values.timezone.trim() } : {}),
+      ...missedFirePolicy,
+    };
   }
   throw new Error(`Unknown schedule type "${type}" (use cron | every | once)`);
 }
@@ -167,7 +173,7 @@ export type NewTriggerDraft = {
 };
 
 export type SidebarDeps = {
-  /** Long-running pane (Enter stays open) vs one-shot picker. */
+  /** Affects footer label only; Enter stays in the TUI for both modes. */
   sidebar: boolean;
   initialTab: SidebarTab;
   loadData: () => Promise<SidebarData>;
@@ -235,16 +241,23 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
   };
   const onSignal = (signal: NodeJS.Signals) => {
     restoreTerminal();
-    process.exit(signal === "SIGTERM" ? 143 : 129);
+    process.exit(signal === "SIGTERM" ? 143 : signal === "SIGINT" ? 130 : 129);
   };
   process.once("exit", restoreTerminal);
   process.once("SIGTERM", onSignal);
   process.once("SIGHUP", onSignal);
+  process.once("SIGINT", onSignal);
 
   try {
     await new Promise<void>((resolve) => {
       let done = false;
       let pollTimer: ReturnType<typeof setInterval> | undefined;
+      let refreshing = false;
+      let tick = 0;
+      let lastSignature = sidebarSignature(data);
+      let loadVersion = 0;
+      let tabChangeVersion = 0;
+      let tabWriteInFlight = 0;
       const finish = () => {
         if (done) return;
         done = true;
@@ -266,16 +279,32 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
 
       const currentRow = (): SidebarRow | undefined => rows[cursor];
 
+      const sanitizeMessage = (msg: string) => msg.replace(/\s*\n\s*/g, " · ");
+      const errorMessage = (error: unknown) => sanitizeMessage(error instanceof Error ? error.message : String(error));
+      const setMessage = (msg: string) => {
+        message = sanitizeMessage(msg);
+      };
+
       const switchTab = (delta: number) => {
         tab = nextTab(tab, delta);
+        const selectedTab = tab;
+        const changeVersion = ++tabChangeVersion;
         query = "";
         filtering = false;
         cursor = 0;
         scroll = 0;
         reslice();
-        message = `tab: ${TAB_LABEL[tab]}`;
+        setMessage(`tab: ${TAB_LABEL[tab]}`);
         render();
-        void deps.onTabChange?.(tab);
+        if (deps.onTabChange) {
+          tabWriteInFlight = changeVersion;
+          void Promise.resolve()
+            .then(() => deps.onTabChange?.(selectedTab))
+            .catch((error) => flash(errorMessage(error)))
+            .finally(() => {
+              if (tabWriteInFlight === changeVersion) tabWriteInFlight = 0;
+            });
+        }
       };
 
       const step = (delta: number) => {
@@ -285,24 +314,28 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
       };
 
       const flash = (msg: string) => {
-        message = msg;
+        setMessage(msg);
         if (!done) render();
       };
 
       /** Run an injected side effect, guarding against overlap and reloading after. */
       const act = async (label: string, fn: () => Promise<string>) => {
         if (busy) return;
+        const keepId = currentRow()?.id;
         busy = true;
-        message = label;
+        loadVersion += 1;
+        setMessage(label);
         render();
         try {
           const result = await fn();
           data = await deps.loadData();
-          reslice(currentRow()?.id);
-          message = result;
+          lastSignature = sidebarSignature(data);
+          reslice(keepId);
+          setMessage(result);
         } catch (error) {
-          message = error instanceof Error ? error.message : String(error);
+          setMessage(errorMessage(error));
         } finally {
+          loadVersion += 1;
           busy = false;
           if (!done) render();
         }
@@ -325,13 +358,13 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
         }
         if (deps.openPopup) {
           // Centered popup over the whole window; blocks until the operator closes it.
-          message = `preview: ${title}`;
+          setMessage(`preview: ${title}`);
           render();
           let popup: Promise<boolean>;
           try {
             popup = deps.openPopup(title, text);
           } catch (error) {
-            flash(error instanceof Error ? error.message : String(error));
+            flash(errorMessage(error));
             return;
           }
           void popup
@@ -340,7 +373,7 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
               if (!shown) dialog = { kind: "preview", title, lines: text.split("\n"), scroll: 0 };
               render();
             })
-            .catch((error) => flash(error instanceof Error ? error.message : String(error)));
+            .catch((error) => flash(errorMessage(error)));
           return;
         }
         dialog = { kind: "preview", title, lines: text.split("\n"), scroll: 0 };
@@ -352,7 +385,8 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
         if (row?.kind !== "trigger") { flash("edit schedule: select a trigger"); return; }
         if (row.trigger.source.kind !== "schedule") { flash("edit schedule: trigger is not a schedule"); return; }
         const trigger = row.trigger;
-        const form = scheduleTimingToForm(trigger.source.kind === "schedule" ? trigger.source.timing : undefined);
+        const timing = row.trigger.source.timing;
+        const form = scheduleTimingToForm(timing);
         dialog = {
           kind: "form",
           title: `edit schedule · ${trigger.id}`,
@@ -366,8 +400,8 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
             { key: "timezone", label: "timezone", value: form.timezone, hint: "cron only (optional)" },
           ],
           submit: async (values) => {
-            const timing = formToScheduleTiming(values as ScheduleFormValues);
-            return deps.saveSchedule(trigger, timing);
+            const nextTiming = formToScheduleTiming(values as ScheduleFormValues, timing);
+            return deps.saveSchedule(trigger, nextTiming);
           },
         };
         render();
@@ -490,18 +524,22 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
       const submitForm = async (form: Extract<Dialog, { kind: "form" }>) => {
         if (busy) return;
         const values = Object.fromEntries(form.fields.map((f) => [f.key, f.value.trim()]));
+        const keepId = currentRow()?.id;
         busy = true;
-        message = "saving…";
+        loadVersion += 1;
+        setMessage("saving…");
         render();
         try {
           const result = await form.submit(values);
           data = await deps.loadData();
+          lastSignature = sidebarSignature(data);
           dialog = undefined;
-          reslice(currentRow()?.id);
-          message = result;
+          reslice(keepId);
+          setMessage(result);
         } catch (error) {
-          message = error instanceof Error ? error.message : String(error);
+          setMessage(errorMessage(error));
         } finally {
+          loadVersion += 1;
           busy = false;
           if (!done) render();
         }
@@ -509,7 +547,10 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
 
       const onDialogKey = (value: string, key: readline.Key) => {
         const d = dialog!;
-        if (key.name === "escape") { dialog = undefined; flash("cancelled"); return; }
+        if (key.name === "escape") {
+          if (busy && (d.kind === "form" || d.kind === "confirm")) return;
+          dialog = undefined; flash("cancelled"); return;
+        }
         if (d.kind === "preview" || d.kind === "help") {
           if (key.name === "up" || key.name === "k") { d.scroll = Math.max(0, d.scroll - 1); render(); return; }
           if (key.name === "down" || key.name === "j") { d.scroll += 1; render(); return; }
@@ -520,14 +561,16 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
           if (busy) return;
           if (key.name === "y" || key.name === "return" || key.name === "enter") {
             void (async () => {
-              busy = true; message = "working…"; render();
+              const keepId = currentRow()?.id;
+              busy = true; loadVersion += 1; setMessage("working…"); render();
               try {
                 const result = await d.confirm();
                 data = await deps.loadData();
-                dialog = undefined; reslice(currentRow()?.id); message = result;
+                lastSignature = sidebarSignature(data);
+                dialog = undefined; reslice(keepId); setMessage(result);
               } catch (error) {
-                message = error instanceof Error ? error.message : String(error);
-              } finally { busy = false; if (!done) render(); }
+                setMessage(errorMessage(error));
+              } finally { loadVersion += 1; busy = false; if (!done) render(); }
             })();
           } else { dialog = undefined; flash("cancelled"); }
           return;
@@ -549,8 +592,11 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
         if (filtering) {
           if (key.name === "escape") { query = ""; filtering = false; reslice(); flash("filter cleared"); return; }
           if (key.name === "return" || key.name === "enter") { filtering = false; flash(`filter: ${query || "(none)"}`); return; }
-          if (key.name === "backspace") { query = query.slice(0, -1); reslice(); render(); return; }
-          if (value && !key.ctrl && !key.meta && value.length === 1 && value >= " ") { query += value; reslice(); render(); return; }
+          if (key.name === "backspace") { const keepId = currentRow()?.id; query = query.slice(0, -1); reslice(keepId); render(); return; }
+          if (value && !key.ctrl && !key.meta && value.length === 1 && value >= " ") {
+            const keepId = currentRow()?.id;
+            query += value; reslice(keepId); render(); return;
+          }
           return;
         }
         if (key.name === "escape" || (key.name === "q")) { finish(); return; }
@@ -578,7 +624,8 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
         const lines: string[] = [renderTabBar(tab, width), ""];
         const bodyRows = Math.max(3, height - 5);
         if (dialog) {
-          lines.push(...renderDialog(dialog, width, bodyRows));
+          const dialogLines = renderDialog(dialog, width, bodyRows).slice(0, bodyRows);
+          lines.push(...dialogLines, ...blanks(bodyRows - dialogLines.length));
         } else {
           const rowSlots = visibleRowSlots(tab, bodyRows);
           if (cursor < scroll) scroll = cursor;
@@ -598,7 +645,7 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
             for (let i = renderedRows.length; i < bodyRows; i += 1) lines.push("");
           }
         }
-        lines.push(truncate(filtering ? c.cyan(`/${query}`) : message, width));
+        lines.push(truncate(filtering ? c.cyan(`/${query}`) : sanitizeMessage(message), width));
         lines.push(c.dim(truncate(footerHint(), width)));
         stdout.write(`\x1b[2J\x1b[H${lines.map((line) => clampLine(line, width)).join("\n")}`);
       };
@@ -617,14 +664,14 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
       stdin.on("keypress", onKey);
       stdout.on("resize", onResize);
 
-      let refreshing = false;
-      let tick = 0;
-      let lastSignature = sidebarSignature(data);
       pollTimer = setInterval(() => {
         tick += 1;
         if (deps.syncTab) {
+          const issuedTabVersion = tabChangeVersion;
+          const issuedDuringWrite = tabWriteInFlight !== 0;
           void deps.syncTab().then((next) => {
             if (done || dialog || busy || !next || next === tab) return;
+            if (issuedTabVersion !== tabChangeVersion || issuedDuringWrite || tabWriteInFlight !== 0) return;
             tab = next;
             query = "";
             filtering = false;
@@ -632,17 +679,19 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
             scroll = 0;
             reslice();
             render();
-          });
+          }).catch(() => {});
         }
         if (!dialog && !busy && tab === "triggers" && rows.some((row) => row.kind === "trigger" && row.trigger.source.kind === "schedule")) {
           render();
         }
         if (tick % 2 === 0 && !refreshing) {
           refreshing = true;
+          const issuedLoadVersion = loadVersion;
           void deps
             .loadData()
             .then((next) => {
               if (done || dialog || busy) return;
+              if (issuedLoadVersion !== loadVersion) return;
               const signature = sidebarSignature(next);
               if (signature === lastSignature) return;
               lastSignature = signature;
@@ -659,6 +708,7 @@ export async function runSidebarTui(deps: SidebarDeps): Promise<void> {
     process.off("exit", restoreTerminal);
     process.off("SIGTERM", onSignal);
     process.off("SIGHUP", onSignal);
+    process.off("SIGINT", onSignal);
     restoreTerminal();
   }
 }
@@ -814,8 +864,14 @@ function renderDialog(dialog: Dialog, width: number, bodyRows: number): string[]
   dialog.fields.forEach((field, i) => {
     const marker = i === dialog.index ? c.accent(sym.bee) : " ";
     const label = c.dim(field.label.padEnd(labelWidth));
-    const value = i === dialog.index ? `${field.value}${c.accent("▏")}` : field.value || c.dim(field.hint ? `(${field.hint})` : "");
-    lines.push(`${marker} ${label}  ${truncate(value, Math.max(4, width - labelWidth - 5))}`);
+    const valueWidth = Math.max(4, width - labelWidth - 5);
+    const tailWidth = Math.max(0, valueWidth - 1);
+    const visibleTail = tailWidth > 0 ? field.value.slice(-tailWidth) : "";
+    const value =
+      i === dialog.index ? `${visibleTail}${c.accent("▏")}`
+      : field.value ? truncate(field.value, valueWidth)
+      : c.dim(truncate(field.hint ? `(${field.hint})` : "", valueWidth));
+    lines.push(`${marker} ${label}  ${value}`);
   });
   while (lines.length < bodyRows) lines.push("");
   return lines;
