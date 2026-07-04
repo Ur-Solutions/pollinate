@@ -11,9 +11,6 @@ name = "Hourly Echo"
 [trigger.source]
 kind = "manual"
 
-[trigger.delivery]
-mode = "immediate"
-
 [trigger.action]
 kind = "command"
 command = "echo hi"
@@ -28,6 +25,25 @@ command = "echo hi"
     expect(parsed.source).toEqual({ kind: "manual" });
     expect(parsed.delivery).toEqual({ mode: { strategy: "immediate" }, maxConcurrent: 1 });
     expect(parsed.action).toEqual({ kind: "command", command: "echo hi", cwd: undefined, timeout: undefined });
+  });
+
+  test("defaults empty delivery config to immediate", () => {
+    const parsed = parseTriggerToml(
+      `[trigger]
+id = "empty-delivery"
+
+[trigger.source]
+kind = "manual"
+
+[trigger.delivery]
+
+[trigger.action]
+kind = "command"
+command = "true"
+`,
+    );
+
+    expect(parsed.delivery).toEqual({ mode: { strategy: "immediate" }, maxConcurrent: 1 });
   });
 
   test("parses a full router config including snake_case aliases", () => {
@@ -185,6 +201,71 @@ command = "true"
 `,
       ),
     ).toThrow(/Invalid duration/);
+  });
+
+  test("validates cron expressions and timezones at parse time", () => {
+    const cronTrigger = (timing: string) => `[trigger]
+id = "cron"
+
+[trigger.source]
+kind = "schedule"
+
+[trigger.source.timing]
+${timing}
+
+[trigger.action]
+kind = "command"
+command = "true"
+`;
+
+    expect(() => parseTriggerToml(cronTrigger('type = "cron"\nexpression = "0 8 * * 1-5 *"'))).toThrow(/5 fields/);
+    expect(() => parseTriggerToml(cronTrigger('type = "cron"\nexpression = "0 8 * * 1-5"\ntimezone = "Europe/Osloo"'))).toThrow(
+      /Invalid cron timezone/,
+    );
+    expect(() => parseTriggerToml(cronTrigger('type = "cron"\nexpression = "0 0 30 2 *"'))).toThrow(/can never match/);
+  });
+
+  test("defaults batched maxBatch high enough for window aggregation", () => {
+    const parsed = parseTriggerToml(
+      `[trigger]
+id = "batch"
+
+[trigger.source]
+kind = "manual"
+
+[trigger.delivery]
+mode = "batched"
+window = "30s"
+
+[trigger.action]
+kind = "command"
+command = "true"
+`,
+    );
+
+    expect(parsed.delivery.mode).toEqual({ strategy: "batched", window: "30s", maxBatch: 1000 });
+  });
+
+  test("rejects context sources written as a table", () => {
+    expect(() =>
+      parseTriggerToml(
+        `[trigger]
+id = "bad-context"
+
+[trigger.source]
+kind = "manual"
+
+[trigger.context.sources]
+var = "diff"
+kind = "command"
+command = "true"
+
+[trigger.action]
+kind = "command"
+command = "true"
+`,
+      ),
+    ).toThrow(/trigger\.context\.sources must be an array of tables/);
   });
 });
 
