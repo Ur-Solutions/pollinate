@@ -1,8 +1,9 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { tmpdir } from "node:os";
-import { vi } from "vitest";
 import { PollinateStore, type Job, type JobStatus, type Trigger } from "../src/index.js";
+
+const pathStubRefs = new Map<string, number>();
 
 export async function withTempStore<T>(fn: (store: PollinateStore, root: string) => Promise<T>): Promise<T> {
   const root = await mkdtemp(join(tmpdir(), "pollinate-test-"));
@@ -71,10 +72,6 @@ export async function waitForTerminalJobs(store: PollinateStore, count: number, 
   }
 }
 
-export function useFakeTimers(): void {
-  vi.useFakeTimers({ shouldAdvanceTime: true });
-}
-
 export type CommandStub = {
   binDir: string;
   logPath: string;
@@ -96,19 +93,40 @@ export async function installHiveStub(root: string, options: { script?: string }
 export async function installCommandStub(root: string, name: string, script: string, logPath = join(root, `${name}.log`)): Promise<CommandStub> {
   const binDir = join(root, "bin");
   await mkdir(binDir, { recursive: true });
-  await writeFile(join(binDir, name), script);
+  await writeFile(join(binDir, name), name === "hermes" ? script : stripNoopStdinDrain(script));
   await chmod(join(binDir, name), 0o700);
-  const previousPath = process.env.PATH;
-  if (!previousPath?.split(":").includes(binDir)) process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+  const refs = pathStubRefs.get(binDir) ?? 0;
+  if (refs === 0 && !pathParts(process.env.PATH).includes(binDir)) process.env.PATH = [binDir, ...pathParts(process.env.PATH)].join(delimiter);
+  pathStubRefs.set(binDir, refs + 1);
+  let restored = false;
   return {
     binDir,
     logPath,
     log: () => readFile(logPath, "utf8").catch(() => ""),
     restore() {
-      if (previousPath === undefined) delete process.env.PATH;
-      else process.env.PATH = previousPath;
+      if (restored) return;
+      restored = true;
+      const nextRefs = (pathStubRefs.get(binDir) ?? 1) - 1;
+      if (nextRefs > 0) {
+        pathStubRefs.set(binDir, nextRefs);
+        return;
+      }
+      pathStubRefs.delete(binDir);
+      const nextPath = pathParts(process.env.PATH)
+        .filter((part) => part !== binDir)
+        .join(delimiter);
+      if (nextPath) process.env.PATH = nextPath;
+      else delete process.env.PATH;
     },
   };
+}
+
+function pathParts(value: string | undefined): string[] {
+  return value ? value.split(delimiter).filter(Boolean) : [];
+}
+
+function stripNoopStdinDrain(script: string): string {
+  return script.replace(/(^|\n)cat >\/dev\/null\n/g, "$1");
 }
 
 function defaultHiveScript(logPath: string): string {
@@ -123,6 +141,5 @@ if [ "$1" = "spawn" ]; then
   done
   printf '%s\\tcodex\\t/tmp\\tlocal\\n' "$name"
 fi
-cat >/dev/null
 `;
 }
