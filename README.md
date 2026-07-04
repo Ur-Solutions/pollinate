@@ -22,17 +22,27 @@ pollinate --help
 `POLLINATE_STORE_ROOT` controls the on-disk store. By default it is `~/.pollinate`:
 
 ```text
-triggers/<id>.toml
-router-plugins/<name>.mjs
-state/schedule-state.json
-state/delivery-state.json
-state/cursors.json
-state/job-id-index.json
-jobs/<jobId>.json
-ledger.jsonl
+~/.pollinate/
+  triggers/<id>.toml
+  router-plugins/<name>.mjs
+  state/schedule-state.json
+  state/delivery-state.json
+  state/cursors.json
+  state/job-id-index.json
+  state/job-id-index.lock
+  state/trigger-locks/<id>.lock
+  state/job-locks/<jobId>.lock
+  state/router-bindings/<trigger>/<subject>.json
+  state/router-bindings/<trigger>/<subject>.lock
+  jobs/<jobId>.json
+  ledger.jsonl
+  daemon.log
+  daemon.out.log
+  daemon.err.log
+  pollinate.toml
 ```
 
-Job IDs follow the Honeybee-style shape `<trigger-prefix><uuid-prefix>`, for example
+Job IDs follow the Honeybee-style shape `<trigger-prefix>.<uuid-prefix>`, for example
 `HE.a3f`. The prefix is derived from the trigger ID, and the suffix is the shortest
 globally unused UUID prefix with at least three alphanumeric characters. The backing
 UUID is stored on the job and the index keeps suffixes from being reused over time.
@@ -214,7 +224,8 @@ command = "echo auditing {{repo}} from {{trigger_id}}"
 timeout = "30s"
 ```
 
-Supported action kinds are `command`, `http`, `honeybee`, `hermes`, and `emit`.
+Supported action kinds are `command`, `http`, `honeybee`, `hermes`, `emit`, and
+`sequence`.
 Supported delivery modes are `immediate`, `throttled`, `batched`, and `debounced`.
 
 `cwd` is a trigger-level default working directory for command-backed work. Poll

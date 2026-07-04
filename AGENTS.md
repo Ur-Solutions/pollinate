@@ -12,7 +12,8 @@ everything here is otherwise only discoverable by reading the source.
 - Store root: `~/.pollinate`, overridable with `POLLINATE_STORE_ROOT`.
 - Add `--json` to any command for machine-readable output. Errors with `--json`
   print `{"error": "..."}` to stderr and exit 1.
-- Dev loop: `pnpm build` (tsc), `pnpm test` (vitest), `pnpm check` (both).
+- Dev loop: `pnpm build` (tsc), `pnpm test` (build + vitest), `pnpm check`
+  (build + test typecheck + lint + test).
 - `pol add <file.toml>` and `pol create <id>` **overwrite** an existing trigger
   with the same id silently — check `pol get <id>` first if that matters.
 - `--dry-run` exists on `pol trigger` and the `pol github …` commands only.
@@ -26,10 +27,17 @@ everything here is otherwise only discoverable by reading the source.
   state/schedule-state.json       next/last fire times
   state/delivery-state.json       throttle/batch/debounce queues
   state/cursors.json              poll cursors
+  state/job-id-index.json         UUIDs used for visible job ID suffixes
+  state/job-id-index.lock         lock for the job ID index
+  state/trigger-locks/<id>.lock   per-trigger write locks
+  state/job-locks/<jobId>.lock    per-job write locks
   state/router-bindings/<trigger>/<subject>.json   binding records
+  state/router-bindings/<trigger>/<subject>.lock   binding write locks
   jobs/<jobId>.json               one job per execution
   ledger.jsonl                    append-only event log (the source of truth)
   daemon.log                      daemon lifecycle + GC log (pol daemon logs)
+  daemon.out.log                  macOS launchd stdout log
+  daemon.err.log                  macOS launchd stderr log
   pollinate.toml                  daemon config
 ```
 
@@ -44,7 +52,7 @@ everything here is otherwise only discoverable by reading the source.
 | `pol routers [list] / routers init <name>` | router plugin management |
 | `pol hooks / hook create|inbox|wait|gc|test` | webhook endpoints, temporary hooks |
 | `pol github create-pr-router / install-pr-router` | PR review router scaffolding + GitHub webhook install |
-| `pol daemon install|start|stop|restart|status|logs|run` | service management |
+| `pol daemon install|uninstall|start|stop|restart|status|logs|run` | service management |
 | `pol satellite run --target … --secret …` | public relay → local daemon |
 | `pol status / ledger [-n N] [--follow]` | dashboard / event stream |
 
