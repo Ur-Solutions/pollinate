@@ -119,10 +119,6 @@ export async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-export async function removePath(path: string): Promise<void> {
-  await rm(path, { force: true, recursive: true });
-}
-
 export function isEnoent(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: string }).code === "ENOENT";
 }

@@ -40,6 +40,7 @@ import {
   pad,
   relativeTime,
   say,
+  sourceDetail,
   sourceLabel,
   spinner,
   statusDot,
@@ -1164,8 +1165,17 @@ async function cmdLedger(store: PollinateStore, args: ParsedArgs): Promise<void>
   const lines = numberFlag(args, "n") ?? numberFlag(args, "lines");
   if (!args.flags.follow) {
     const ledger = await store.readLedger(lines);
+    // --json emits parsed event objects (not raw JSON strings) so consumers get
+    // objects, matching the NDJSON objects that --follow --json streams. (LAB-119)
+    const parsed = ledger.map((line) => {
+      try {
+        return JSON.parse(line) as unknown;
+      } catch {
+        return line;
+      }
+    });
     const human = ledger.length ? ledger.map(renderLedgerLine).join("\n") : c.dim("Ledger is empty.");
-    print(args, ledger, human);
+    print(args, parsed, human);
     return;
   }
   let seen = (await store.readLedger()).length;
@@ -1269,25 +1279,6 @@ function renderTrigger(trigger: Trigger): string {
 
 function triggerSummary(trigger: Trigger): string {
   return `${trigger.source.kind} ${sym.arrow} ${trigger.router ? `router:${trigger.router.plugin}` : trigger.action?.kind ?? "none"}`;
-}
-
-function sourceDetail(source: Source): string {
-  switch (source.kind) {
-    case "manual":
-      return "on demand";
-    case "schedule": {
-      const t = source.timing;
-      if (t.type === "every") return `every ${t.interval}`;
-      if (t.type === "cron") return `cron ${t.expression}${t.timezone && t.timezone !== "UTC" ? ` (${t.timezone})` : ""}`;
-      return `once at ${t.at}`;
-    }
-    case "webhook":
-      return `/hook/${source.webhook.path}${source.webhook.secret ? ` ${sym.mid} secured` : ""}`;
-    case "poll":
-      return `every ${source.poll.interval} ${sym.mid} ${source.poll.fetch.kind}`;
-    default:
-      return "";
-  }
 }
 
 function describeDelivery(delivery: Delivery): string {

@@ -317,7 +317,8 @@ timeout = "1s"
       expect(JSON.parse(status.stdout).triggers.enabled).toBe(1);
 
       const ledger = await execFileAsync(process.execPath, [cli, "ledger", "-n", "5", "--json"], { env });
-      expect(JSON.parse(ledger.stdout).some((line: string) => line.includes("pollinate.job.completed"))).toBe(true);
+      // --json emits parsed event objects (LAB-119), not raw JSON strings.
+      expect(JSON.parse(ledger.stdout).some((entry: { event?: string }) => entry.event === "pollinate.job.completed")).toBe(true);
     });
   });
 });
