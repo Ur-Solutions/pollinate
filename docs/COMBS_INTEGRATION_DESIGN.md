@@ -32,9 +32,40 @@ additive GitHub `pr_head_sha`/`head_sha` fields; literal Comb names; 19 explicit
 engine-alignment points for C2/C4/C5/C10/C16/S10; owner-scoped coverage; and
 the shared golden-contract corpus. Those elements are preserved here.
 
-This is a design, not a description of already-landed behavior. Current
-Pollinate has no Comb action, run target, delivery outbox, observation spec, or
-coverage registry. The evidence for each extension point is cited below.
+This is primarily a staged design, not a blanket claim of landed behavior. The
+pinned Comb action is implemented by the action slice; run targets, the
+delivery outbox, observation specs, and coverage remain later slices. The
+evidence for each extension point is cited below.
+
+### Action-slice pre-verification (2026-07-28)
+
+The action slice was checked against Honeybee commit `969cb27b` and the
+executable `contracts/combs/v1/cli-golden.json` corpus before implementation:
+
+- `hive comb run` now requires the exact flag `--product <key>`. Its CLI error
+  states that strict-spine slice 1 never infers product identity from cwd.
+  Pollinate therefore requires a literal `product` action field and never uses
+  `basename(cwd)`.
+- Honeybee's run-graph retry defaults are exactly
+  `retryBackoffMs=5_000` and `retryBackoffMaxMs=300_000`. They are engine
+  activation-policy constants, not Pollinate action retry timers. This slice
+  only classifies process failures and canonical exit 7 as retryable; the
+  durable-transport slice still owns its outbox timing constants.
+- Honeybee's delivery replay index is exactly
+  `~/.hive/combs/deliveries/<sha256-of-delivery-id>.json`, with adjacent lock
+  `~/.hive/combs/deliveries/.<sha256-of-delivery-id>.lock`. Pollinate creates
+  no parallel replay store in the action slice; it supplies a stable
+  provider-qualified delivery ID and trusts the engine index.
+- Revision-bearing observations remain mandatory before mutation:
+  `comb observe` requires `--subject-rev`, and instantiation rejects missing
+  subject revisions. GitHub activities such as issue comments that lack a
+  head SHA cannot become revision-sensitive observations. This is irrelevant
+  to the action slice because observations and run-event delivery are out of
+  scope.
+- The current strict-spine engine explicitly rejects `--event-json` because
+  subscriptions are disabled. The action maps the Pollinate event through
+  `input` and passes only `--origin-trigger`/`--origin-delivery`. Event
+  transport stays disabled until its engine seam exists.
 
 ## 1. Data model
 
@@ -59,7 +90,8 @@ export type CombRunAction = {
   run: "comb";
   comb: string; // literal registry name; never rendered
   version: number; // required positive immutable registry version
-  input: JsonValue;
+  product: string; // literal explicit engine product key; never inferred
+  input: JsonObject;
   collision?: "refuse" | "join-existing";
 };
 
@@ -69,12 +101,12 @@ export type HoneybeeAction =
 ```
 
 This is the exact logical action shape owned by the engine contract §9.7.
-`comb` containing `{{` or `}}` is rejected during normalization, and `version`
-must be a safe positive integer. The generic renderer currently renders every
-string in an action (`src/templates.ts:67-100`), so the Comb renderer must
-treat `comb` and `version` as immutable control fields rather than ordinary
-templates. That is the Pollinate half of C17 and the immutable-version half of
-S5.
+`comb` or `product` containing `{{` or `}}` is rejected during normalization,
+and `version` must be a safe positive integer. The generic renderer currently
+renders every string in an action (`src/templates.ts:67-100`), so the Comb
+renderer must treat `comb`, `product`, and `version` as immutable control
+fields rather than ordinary templates. That is the Pollinate half of C17 and
+the immutable-version half of S5.
 
 Event and observation delivery are internal outbox operations, not extra
 author-authored Honeybee action modes:
@@ -457,9 +489,9 @@ on a three-strikes heuristic.
 | File | Change and current grounding |
 |---|---|
 | `src/types.ts` | Add `CombRunAction`, target union, observation/coverage/delivery records, and typed job result. The present action and target definitions are at `src/types.ts:58-90` and `src/types.ts:185-211`. |
-| `src/config.ts` | Normalize literal name/version/input and `[trigger.observation]`; accept exactly one sink. Current action normalization is centralized at `src/config.ts:328-419`. |
-| `src/templates.ts` | Add strict typed whole-placeholder rendering for Comb input without rendering `comb`/`version`. Existing behavior is at `src/templates.ts:11-27` and `src/templates.ts:67-100`. |
-| `src/actions.ts` | Enqueue Comb run transport, validate the run envelope, set `targetKind:"run"`, and leave `parseHiveHandle` only on spawn. Current handle parsing is `src/actions.ts:394-407`; current spawn-only use is `src/actions.ts:262-285`. |
+| `src/config.ts` | Normalize literal name/version/product/input and `[trigger.observation]`; accept exactly one sink. Current action normalization is centralized at `src/config.ts:328-419`. |
+| `src/templates.ts` | Add strict typed whole-placeholder rendering for Comb input without rendering `comb`/`product`/`version`. Existing behavior is at `src/templates.ts:11-27` and `src/templates.ts:67-100`. |
+| `src/actions.ts` | In the action slice, invoke Comb run transport directly, validate the run envelope, store `runId`, and leave `parseHiveHandle` only on spawn. Durable enqueue and `targetKind:"run"` remain the transport/bindings slices. |
 | `src/process.ts` | No semantic change; continue argv execution and stdin piping at `src/process.ts:29-40` and `src/process.ts:43-73`. |
 | `src/store.ts`, `src/fsx.ts` | Add delivery, lane, coverage, and multi-binding paths plus atomic/locked CRUD. Current store paths and binding lock are `src/store.ts:60-94` and `src/store.ts:235-247`. |
 | `src/delivery.ts` | Shape observations and durably enqueue before execution. Existing queue persistence is `src/delivery.ts:180-305`. |
@@ -500,6 +532,7 @@ kind = "honeybee"
 run = "comb"
 comb = "human-last-pr"
 version = 3
+product = "pollinate"
 collision = "join-existing"
 
 [trigger.action.input]
@@ -509,8 +542,8 @@ headSha = "{{head_sha}}"
 openedEvent = "{{event}}"
 ```
 
-`comb` and `version` are inspected statically before rendering. The input is
-rendered to one JSON object and written to stdin.
+`comb`, `product`, and `version` are inspected statically before rendering.
+The input is rendered to one JSON object and written to stdin.
 
 **ALIGN-TO-ENGINE-REV (C5-1):** The invocation is the exact engine §5.4
 provenance form:
@@ -518,15 +551,18 @@ provenance form:
 ```text
 hive comb run <comb> --version <n> --input - --cwd <cwd> --product <key>
   --origin-trigger <trigger-id> --origin-delivery <delivery-id>
-  --event-json <canonical-compact-RoutedRunEvent> --json
+  [--collision refuse|join-existing] --json
 ```
 
 Optional `--collision refuse|join-existing` is appended only when the action
-declares it. `deliveryId` is globally unique and durable; the same ID always
-replays the same request digest. The canonical event's `triggerId` and
-`deliveryId` equal the flags.
+declares it. `deliveryId` is globally unique and durable; a provider delivery
+ID is qualified by trigger/source, while sources without one use the persisted
+job UUID. The same ID always replays the same request digest. Strict-spine
+slice 1 rejects `--event-json`; the event enters the run only through the
+typed `input` mapping in this slice.
 
-**ALIGN-TO-ENGINE-REV (C2-1):** The origin event is exactly:
+**LATER TRANSPORT SLICE — ALIGN-TO-ENGINE-REV (C2-1):** Once subscriptions
+and run-event transport are enabled, the origin event is exactly:
 
 ```ts
 export type RoutedRunEvent = {
@@ -626,6 +662,10 @@ The completed Pollinate job stores:
 `pollinate.comb.run_started {trigger_id,delivery_id,event_id,comb,version,run_id}`.
 A joined or replayed result emits no second event and creates no second
 Flightboard association.
+
+Until the later canonical-event slice lands, `event_id` equals the stable
+delivery ID. That avoids inventing a revision-bearing routed event while the
+strict-spine engine rejects `--event-json`.
 
 **ALIGN-TO-ENGINE-REV (C5-3):** `join-existing` succeeds only after Honeybee
 atomically accepts the optional origin event into exactly one subscription
@@ -939,7 +979,8 @@ and executor (`src/types.ts:58-77`, `src/actions.ts:253-313`). No flow trigger
 is automatically converted. Re-authoring is:
 
 1. Define and validate an immutable Comb version in Honeybee.
-2. Save the Pollinate trigger with literal `comb` and required `version`.
+2. Save the Pollinate trigger with literal `comb`/`product` and required
+   `version`.
 3. If trigger save fails, retry only the trigger save; the unreferenced Comb
    version changes no existing automation.
 4. Remove the old flow trigger only after the pinned Comb trigger is enabled
@@ -1182,41 +1223,35 @@ contract revision.
 
 ## 10. Open risks and unreconstructed details
 
-1. **Product-key resolution is still an external seam.** Engine §5.4 requires
-   Pollinate to pass `--product <key>`, while its §9.7 logical action shape does
-   not carry a product field and current Pollinate has no product resolver.
-   This document does not invent one. Comb action enablement is blocked until
-   Honeybee exposes an authoritative cwd→product resolver or the canonical
-   action/config contract names the field.
-2. **Exact retry timing constants were not preserved in the seal.** The
+1. **Exact Pollinate outbox retry timing was not preserved in the seal.** The
    recoverable contract is bounded exponential backoff swept on
    `bindingGcMs`; base, cap, and jitter from the stranded copy are unknown.
-   Before implementation, record those constants in daemon config and the
-   shared fault-injection fixtures. Do not claim byte-for-byte parity with the
-   lost revision until it is diffed.
-3. **The exact stranded internal filenames were not preserved.** The
+   The engine's separate 5,000/300,000 ms graph-retry constants do not resolve
+   this Pollinate-owned choice. Before transport implementation, record the
+   outbox constants in daemon config and shared fault-injection fixtures.
+2. **The exact stranded internal filenames were not preserved.** The
    `state/run-delivery/` and `state/observation-coverage/` layout above is the
    reconstruction's scalable Pollinate-owned choice. Wire behavior and crash
    invariants are authoritative; a resurfaced copy may name these files
    differently.
-4. **GitHub payload availability varies by event.** PR and check webhooks have
+3. **GitHub payload availability varies by event.** PR and check webhooks have
    head SHA sources; issue-comment payloads generally do not. Revision-
    sensitive observation triggers must filter to events that actually carry a
    revision or use an explicit poll source. Hidden API fetches are forbidden.
-5. **Router-opened binding adoption needs a race proof.** The engine may issue
+4. **Router-opened binding adoption needs a race proof.** The engine may issue
    registration immediately after `comb.run` while Pollinate is still
    confirming the router-created binding. The subject lock, target/owner
    convergence rule, and shared fixture must prove exactly one active delivery
    path.
-6. **Outbox/job lifecycle requires operator UX.** A transient run delivery can
+5. **Outbox/job lifecycle requires operator UX.** A transient run delivery can
    outlive the action's first process attempt. CLI/job views need a visible
    retrying state and inspection/cancel/resume commands; presenting it as a
    completed or permanently errored ordinary job would be misleading.
-7. **Cross-repo gating is real.** Event-only and strict-action Combs remain
+6. **Cross-repo gating is real.** Event-only and strict-action Combs remain
    disabled until both sides pass the shared corpus and the poll fallback.
    Unit-green local adapters are insufficient.
 
 If the stranded file resurfaces, diff it specifically for the two unrecovered
-internal choices above (retry constants and store filenames), the product-key
-resolution seam, and any additional GitHub event-ID rule. Canonical engine
-contracts still win over either copy.
+internal choices above (Pollinate outbox retry constants and store filenames)
+and any additional GitHub event-ID rule. Canonical engine contracts still win
+over either copy.

@@ -156,6 +156,12 @@ inject commands):
 - `kill`: `target`, `timeout?`
 - `flow`: `flow`, `args?` (map → `--arg k=v`)
 - `loop`: `loop` table (flags passed to `hive loop start`)
+- `comb`: `comb`, `version`, `product`, `input`, `collision?`. The comb,
+  product, and positive version are literal control fields. Pollinate writes
+  the recursively rendered input object to `hive comb run --input -`, passes
+  stable `--origin-trigger`/`--origin-delivery` provenance, and parses only the
+  `comb.run` JSON envelope. Comb router leaves are rejected until run bindings
+  land.
 
 ### Router triggers
 
@@ -236,6 +242,11 @@ plus:
 `github.<webhook_event>.<action>`, with `github.pull_request.merged` synthesized
 when a close has `merged: true`.
 
+Comb input rendering is stricter than ordinary action rendering: an exact
+placeholder is JSON-decoded (`"{{event}}"` can become an object and
+`"{{count}}"` can become a number), while an unresolved placeholder is a fatal
+job error before Hive is invoked.
+
 ## Loop prevention contract
 
 Bees that post PR comments **must** include `<!-- pollinate-router -->` at the
@@ -297,6 +308,8 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 - `pollinate.router.{binding_pending,binding_created,binding_routed,binding_closed,binding_errored,binding_retry,binding_expired,binding_reconciled,already_bound,unbound,open_filtered,activity_errored,gc}`
 - `pollinate.router.plugin.created` · `pollinate.github.webhook.installed`
 - `pollinate.daemon.{started,stopped,triggers_reloaded,reload_errored}`
+- `pollinate.comb.run_started` (fresh created runs only; joined/replayed
+  deliveries do not emit it)
 - `pollinate.emit` (from `emit` actions)
 
 ## Job IDs
