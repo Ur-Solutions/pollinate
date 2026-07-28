@@ -1,7 +1,8 @@
-import type { Action, JsonValue } from "./types.js";
+import type { Action, CombRunAction, JsonValue } from "./types.js";
 import { shellQuote } from "./process.js";
 
 const TEMPLATE_RE = /\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g;
+const WHOLE_TEMPLATE_RE = /^\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}$/;
 
 export type Rendered<T> = {
   value: T;
@@ -17,7 +18,7 @@ export function stringifyTemplateValue(value: unknown): string {
 export function renderString(input: string, vars: Record<string, unknown>): Rendered<string> {
   const warnings: string[] = [];
   const value = input.replace(TEMPLATE_RE, (literal, key: string) => {
-    if (!Object.prototype.hasOwnProperty.call(vars, key)) {
+    if (!Object.hasOwn(vars, key)) {
       warnings.push(`Unresolved template var: ${key}`);
       return literal;
     }
@@ -29,7 +30,7 @@ export function renderString(input: string, vars: Record<string, unknown>): Rend
 export function renderShellCommand(input: string, vars: Record<string, unknown>): Rendered<string> {
   const warnings: string[] = [];
   const value = input.replace(TEMPLATE_RE, (literal, key: string, offset: number) => {
-    if (!Object.prototype.hasOwnProperty.call(vars, key)) {
+    if (!Object.hasOwn(vars, key)) {
       warnings.push(`Unresolved template var: ${key}`);
       return literal;
     }
@@ -69,6 +70,44 @@ export function renderAction(action: Action, vars: Record<string, unknown>): Ren
   return { value: rendered.value as unknown as Action, warnings: rendered.warnings };
 }
 
+/**
+ * Render a Comb input without weakening JSON types. Exact placeholders are
+ * JSON-decoded; mixed strings remain strings. Unlike ordinary templates, every
+ * unresolved Comb input placeholder is fatal.
+ */
+export function renderCombInput(value: JsonValue, vars: Record<string, unknown>): JsonValue {
+  if (Array.isArray(value)) return value.map((item) => renderCombInput(item, vars));
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, renderCombInput(item, vars)]),
+    );
+  }
+  if (typeof value !== "string") return value;
+
+  const whole = WHOLE_TEMPLATE_RE.exec(value);
+  if (whole) {
+    const key = whole[1] ?? "";
+    if (!Object.hasOwn(vars, key)) {
+      throw new Error(`Unresolved Comb input template var: ${key}`);
+    }
+    const rendered = stringifyTemplateValue(vars[key]);
+    try {
+      return JSON.parse(rendered) as JsonValue;
+    } catch {
+      return rendered;
+    }
+  }
+
+  const rendered = renderString(value, vars);
+  if (rendered.warnings.length > 0) {
+    const missing = [...value.matchAll(TEMPLATE_RE)]
+      .flatMap((match) => match[1] ? [match[1]] : [])
+      .filter((key) => !Object.hasOwn(vars, key));
+    throw new Error(`Unresolved Comb input template var: ${[...new Set(missing)].join(", ")}`);
+  }
+  return rendered.value;
+}
+
 function renderActionJsonValue<T extends JsonValue | string | undefined>(
   input: T,
   vars: Record<string, unknown>,
@@ -88,6 +127,16 @@ function renderActionJsonValue<T extends JsonValue | string | undefined>(
     }) as T;
     return { value, warnings };
   }
+  if (isCombRunAction(input)) {
+    const action = input as unknown as CombRunAction;
+    return {
+      value: {
+        ...action,
+        input: renderCombInput(action.input, vars),
+      } as unknown as T,
+      warnings: [],
+    };
+  }
   const warnings: string[] = [];
   const output: Record<string, JsonValue> = {};
   const commandAction = (input as Record<string, JsonValue>).kind === "command";
@@ -98,6 +147,11 @@ function renderActionJsonValue<T extends JsonValue | string | undefined>(
     output[renderedKey.value] = renderedValue.value as JsonValue;
   }
   return { value: output as T, warnings };
+}
+
+function isCombRunAction(value: object): boolean {
+  const record = value as Record<string, unknown>;
+  return record.kind === "honeybee" && record.run === "comb";
 }
 
 function shellEscapeTemplateValue(value: string, context: "single" | "double" | "unquoted"): string {

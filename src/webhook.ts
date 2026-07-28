@@ -170,6 +170,7 @@ export class WebhookServer {
       void this.dispatch(dispatchTrigger, transformed, request.socket.remoteAddress ?? "unknown", {
         path,
         headers: normalizedHeaders(request.headers),
+        ...(deliveryId ? { deliveryId } : {}),
       }).catch((error) =>
         this.store.appendLedger({
           event: "pollinate.webhook.rejected",
@@ -189,9 +190,20 @@ export class WebhookServer {
     trigger: Trigger,
     payload: JsonValue,
     _sourceIp: string,
-    webhook?: { path?: string; headers?: Record<string, string> },
+    webhook?: { path?: string; headers?: Record<string, string>; deliveryId?: string },
   ): Promise<void> {
-    const activation: Activation = { triggerId: trigger.id, source: "webhook", payload, receivedAt: nowIso(), metadata: webhook ? { webhook } : undefined };
+    const activation: Activation = {
+      triggerId: trigger.id,
+      source: "webhook",
+      payload,
+      receivedAt: nowIso(),
+      metadata: webhook
+        ? {
+            ...(webhook.deliveryId ? { deliveryId: webhook.deliveryId } : {}),
+            webhook: { path: webhook.path, headers: webhook.headers },
+          }
+        : undefined,
+    };
     await this.delivery.handle(trigger, activation);
   }
 
