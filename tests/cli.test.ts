@@ -321,4 +321,40 @@ timeout = "1s"
       expect(JSON.parse(ledger.stdout).some((entry: { event?: string }) => entry.event === "pollinate.job.completed")).toBe(true);
     });
   });
+
+  test("jobs gc --dry-run reports removable jobs without deleting them, then a real run deletes them", async () => {
+    await withTempStore(async (store, root) => {
+      const env = { ...process.env, POLLINATE_STORE_ROOT: root };
+      const cli = join(process.cwd(), "dist", "cli.js");
+      const old = new Date(Date.now() - 30 * 86_400_000).toISOString();
+      await store.saveJob({
+        id: "cli-gc-old",
+        triggerId: "cli-gc",
+        source: "manual",
+        status: "completed",
+        context: {},
+        queuedAt: old,
+        completedAt: old,
+      });
+
+      const dry = await execFileAsync(
+        process.execPath,
+        [cli, "jobs", "gc", "--max-age", "14d", "--keep-last", "0", "--dry-run", "--json"],
+        { env },
+      );
+      const dryResult = JSON.parse(dry.stdout);
+      expect(dryResult.deletedJobIds).toEqual(["cli-gc-old"]);
+      expect(await store.getJob("cli-gc-old")).not.toBeNull();
+
+      const real = await execFileAsync(
+        process.execPath,
+        [cli, "jobs", "gc", "--max-age", "14d", "--keep-last", "0", "--json"],
+        { env },
+      );
+      const realResult = JSON.parse(real.stdout);
+      expect(realResult.deletedJobIds).toEqual(["cli-gc-old"]);
+      expect(realResult.perTrigger["cli-gc"]).toEqual({ deleted: 1, kept: 0 });
+      expect(await store.getJob("cli-gc-old")).toBeNull();
+    });
+  });
 });

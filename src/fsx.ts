@@ -35,6 +35,27 @@ export function daemonLogPath(root = storeRoot()): string {
   return join(root, "daemon.log");
 }
 
+/**
+ * Rotates ledger.jsonl to ledger.jsonl.1 (replacing any previous generation)
+ * once it exceeds maxMb. `rename` atomically replaces the destination on
+ * POSIX, and any append already in flight keeps writing to the descriptor it
+ * opened (which now lives at the rotated name) — appendTextLine opens,
+ * writes, and closes per call, so nothing is lost mid-write. The next
+ * appendJsonLine call lazily recreates ledger.jsonl via its `mkdir` + `open`
+ * "a" semantics.
+ */
+export async function rotateLedgerIfLarge(root: string, maxMb: number): Promise<boolean> {
+  if (!Number.isFinite(maxMb) || maxMb <= 0) return false;
+  const path = ledgerPath(root);
+  const info = await stat(path).catch((error) => {
+    if (isEnoent(error)) return undefined;
+    throw error;
+  });
+  if (!info || info.size <= maxMb * 1024 * 1024) return false;
+  await rename(path, `${path}.1`);
+  return true;
+}
+
 export function daemonConfigPath(root = storeRoot()): string {
   return join(root, "pollinate.toml");
 }
