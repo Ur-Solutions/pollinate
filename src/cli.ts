@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PollinateStore } from "./store.js";
+import { PollinateStore, type JobRetentionResult } from "./store.js";
 import { ActionExecutor, createExecutor, fireTriggerNow, parseHiveHandle } from "./actions.js";
 import { parseDuration, sleep, nowIso } from "./time.js";
 import { parseTriggerToml, slugify, triggerToToml } from "./config.js";
@@ -300,11 +300,44 @@ function renderJobOutcome(job: Job): string {
 }
 
 async function cmdJobs(store: PollinateStore, args: ParsedArgs): Promise<void> {
+  if (args.rest[0] === "gc") {
+    await cmdJobsGc(store, args);
+    return;
+  }
   const status = stringFlag(args, "status") as JobStatus | undefined;
   const triggerId = stringFlag(args, "trigger");
   const last = numberFlag(args, "last");
   const jobs = await store.listJobs({ status, triggerId, last });
   print(args, jobs, renderJobList(jobs));
+}
+
+async function cmdJobsGc(store: PollinateStore, args: ParsedArgs): Promise<void> {
+  const config = await store.daemonConfig();
+  const maxAge = stringFlag(args, "max-age") ?? config.retention.jobsMaxAge;
+  const keepLast = numberFlag(args, "keep-last") ?? config.retention.jobsKeepLastPerTrigger;
+  const dryRun = Boolean(args.flags["dry-run"]);
+  const terminalOlderThanDays = parseDuration(maxAge) / 86_400_000;
+  const result = await store.garbageCollectJobs({ terminalOlderThanDays, keepLastPerTrigger: keepLast, dryRun });
+  print(args, result, renderJobsGcResult(result, dryRun));
+}
+
+function renderJobsGcResult(result: JobRetentionResult, dryRun: boolean): string {
+  const verb = dryRun ? "would remove" : "removed";
+  const lines = [
+    `${dryRun ? c.dim("[dry run] ") : ""}${c.bold(verb)} ${result.deleted} terminal ${plural(result.deleted, "job")} older than ${c.dim(result.cutoff)} ${c.dim(`(kept ${result.kept})`)}`,
+  ];
+  const triggerIds = Object.keys(result.perTrigger).sort();
+  if (triggerIds.length) {
+    lines.push("");
+    const rows = triggerIds.map((id) => {
+      const bucket = result.perTrigger[id];
+      return [c.bold(id), String(bucket.deleted), String(bucket.kept)];
+    });
+    lines.push(table(rows, { head: ["trigger", verb, "kept"], align: ["left", "right", "right"] }));
+  } else {
+    lines.push(c.dim("No terminal jobs found."));
+  }
+  return lines.join("\n");
 }
 
 async function cmdSidebar(store: PollinateStore, args: ParsedArgs): Promise<void> {
@@ -1780,9 +1813,11 @@ const VALUE_FLAGS = new Set([
   "header",
   "home",
   "invoke",
+  "keep-last",
   "last",
   "lines",
   "loop",
+  "max-age",
   "max-batch",
   "max-concurrent",
   "max-deliveries",
@@ -2018,6 +2053,7 @@ async function printHelp(): Promise<void> {
     helpSection("Fire & inspect", [
       ["trigger <id> [--dry-run]", "fire now; --payload '{…}' to pass data"],
       ["jobs [--status <s>] [--last n]", "list recent jobs"],
+      ["jobs gc [--max-age 14d] [--keep-last 50] [--dry-run]", "remove old terminal job files"],
       ["job <jobId> | job cancel <id>", "inspect or cancel a job"],
       ["sidebar [--tab <t>]", "live TUI: triggers, active jobs, history (cmd+option+B)"],
       ["sidebar --toggle-sidebar", "open/close the tmux sidebar pane on the right"],

@@ -16,7 +16,7 @@ everything here is otherwise only discoverable by reading the source.
   (build + test typecheck + lint + test).
 - `pol add <file.toml>` and `pol create <id>` **overwrite** an existing trigger
   with the same id silently — check `pol get <id>` first if that matters.
-- `--dry-run` exists on `pol trigger` and the `pol github …` commands only.
+- `--dry-run` exists on `pol trigger`, `pol github …`, and `pol jobs gc`.
 
 ## Store layout
 
@@ -35,6 +35,7 @@ everything here is otherwise only discoverable by reading the source.
   state/router-bindings/<trigger>/<subject>.lock   binding write locks
   jobs/<jobId>.json               one job per execution
   ledger.jsonl                    append-only event log (the source of truth)
+  ledger.jsonl.1                  previous ledger generation (size-based rotation, see Job retention)
   daemon.log                      daemon lifecycle + GC log (pol daemon logs)
   daemon.out.log                  macOS launchd stdout log
   daemon.err.log                  macOS launchd stderr log
@@ -48,6 +49,7 @@ everything here is otherwise only discoverable by reading the source.
 | `pol add / create / list / get / enable / disable / edit / remove` | trigger CRUD; `edit` validates the TOML on editor exit |
 | `pol trigger <id> [--payload '{…}'] [--dry-run]` | fire manually |
 | `pol jobs / job <id> / job cancel <id>` | job inspection |
+| `pol jobs gc [--max-age 14d] [--keep-last 50] [--dry-run]` | remove old terminal job files (see Job retention) |
 | `pol bindings [--trigger <id>] / bindings get <id>` | router binding inspection |
 | `pol routers [list] / routers init <name>` | router plugin management |
 | `pol hooks / hook create|inbox|wait|gc|test` | webhook endpoints, temporary hooks |
@@ -281,7 +283,47 @@ shellArgs = ["-c"]
 inheritEnv = true
 [execution.env]
 PATH = "…"
+
+[retention]
+jobsMaxAge = "14d"           # terminal jobs older than this are GC-eligible
+jobsKeepLastPerTrigger = 50  # safety floor: newest N terminal jobs/trigger are kept regardless of age
+jobsGcMs = 3600000           # jobs + ledger retention sweep interval (default: hourly)
+ledgerMaxMb = 64             # ledger.jsonl is rotated to ledger.jsonl.1 past this size
 ```
+
+## Job retention
+
+`~/.pollinate/jobs/<jobId>.json` accumulates one file per execution and is
+**never pruned automatically except by this GC** — a daemon that runs for
+months without it will eventually `readdir` + `JSON.parse` tens of thousands
+of files on every `pol jobs` listing and on every startup (`recoverStaleJobs`
+scans for stuck jobs), which is exactly what caused a production OOM
+crash-loop (61,812 accumulated terminal job files).
+
+- The daemon runs a jobs + ledger retention sweep on `retention.jobsGcMs`
+  (default hourly) and once immediately at startup, in addition to the
+  binding GC. Only **terminal** jobs (`completed`, `errored`, `timed-out`,
+  `cancelled`) are ever touched — `queued`, `resolving-context`, and
+  `running` jobs are never removed.
+- A terminal job is eligible once it's older than `retention.jobsMaxAge`
+  (by `completedAt`, falling back to `queuedAt`), *unless* it's one of the
+  newest `retention.jobsKeepLastPerTrigger` terminal jobs for its trigger —
+  that floor keeps `pol job <id>` / sidebar history usable even if a trigger
+  has been idle for a while.
+- Ledger rotation is size-based: once `ledger.jsonl` exceeds
+  `retention.ledgerMaxMb`, it's renamed to `ledger.jsonl.1` (replacing any
+  previous generation) and lazily recreated on the next append. `pol ledger`
+  only reads the active file; `ledger.jsonl.1` is a manually-inspectable
+  backstop, not part of `pol ledger`'s output.
+- Failures in the sweep are logged (`pol daemon logs`) and never crash the
+  daemon.
+- Manual control: `pol jobs gc [--max-age <dur>] [--keep-last <n>]
+  [--dry-run]`. Flags default to the `[retention]` config; `--dry-run` reports
+  what would be removed, per trigger, without deleting anything.
+- `recoverStaleJobs` (startup stuck-job recovery) queries
+  `store.listJobs({ statuses: [...] })` for the non-terminal statuses only,
+  so it never has to hold the terminal backlog in memory even before the
+  first GC sweep runs.
 
 ## Ledger events
 
@@ -297,6 +339,7 @@ Append-only JSONL at `~/.pollinate/ledger.jsonl`; every entry has `ts` and
 - `pollinate.router.{binding_pending,binding_created,binding_routed,binding_closed,binding_errored,binding_retry,binding_expired,binding_reconciled,already_bound,unbound,open_filtered,activity_errored,gc}`
 - `pollinate.router.plugin.created` · `pollinate.github.webhook.installed`
 - `pollinate.daemon.{started,stopped,triggers_reloaded,reload_errored}`
+- `pollinate.jobs.gc` · `pollinate.ledger.rotated` (job/ledger retention, see Job retention)
 - `pollinate.emit` (from `emit` actions)
 
 ## Job IDs

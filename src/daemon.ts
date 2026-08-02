@@ -5,13 +5,19 @@ import { ScheduleEngine } from "./schedule.js";
 import { PollinateStore } from "./store.js";
 import { WebhookServer } from "./webhook.js";
 import { nowIso, parseDuration } from "./time.js";
-import { appendTextLine, daemonLogPath } from "./fsx.js";
+import { appendTextLine, daemonLogPath, rotateLedgerIfLarge } from "./fsx.js";
 import { gcTemporaryHooks } from "./hooks.js";
 import { gcRouterBindings, routerGcSummary } from "./router-gc.js";
 import type { DaemonConfig, JobStatus, Trigger } from "./types.js";
 
 const STALE_JOB_RECOVERY_MS = 60_000;
-const TERMINAL_JOB_STATUSES = new Set<JobStatus>(["completed", "errored", "timed-out", "cancelled"]);
+// recoverStaleJobs only ever needs non-terminal jobs, so listJobs({ statuses })
+// never materializes the (potentially huge) terminal job backlog into memory.
+// See the jobs-gc incident: 61,812 terminal job files under ~/.pollinate/jobs/
+// OOM'd the daemon at startup because listJobs() used to parse every job
+// before filtering.
+const NON_TERMINAL_JOB_STATUSES: JobStatus[] = ["queued", "resolving-context", "running"];
+const MS_PER_DAY = 86_400_000;
 let daemonProcessGuardsInstalled = false;
 
 export class PollinateDaemon {
@@ -25,6 +31,8 @@ export class PollinateDaemon {
   private reloadTimer?: NodeJS.Timeout;
   private bindingGcTimer?: NodeJS.Timeout;
   private bindingGcRunning = false;
+  private jobsGcTimer?: NodeJS.Timeout;
+  private jobsGcRunning = false;
   private triggerSignature = "";
   private stopping = false;
   private daemonConfigSignature = "";
@@ -61,6 +69,9 @@ export class PollinateDaemon {
     this.bindingGcTimer = setInterval(() => {
       void this.runBindingGc();
     }, config.defaults.bindingGcMs);
+    this.jobsGcTimer = setInterval(() => {
+      void this.runJobsGc();
+    }, config.retention.jobsGcMs);
     await this.store.appendLedger({
       event: "pollinate.daemon.started",
       trigger_count: triggers.length,
@@ -70,11 +81,12 @@ export class PollinateDaemon {
       recovered_jobs: recoveredJobs,
     });
     await this.log(
-      `daemon started: ${triggers.length} triggers, webhook ${config.webhook.bind}:${config.webhook.port}, binding gc every ${config.defaults.bindingGcMs}ms${
+      `daemon started: ${triggers.length} triggers, webhook ${config.webhook.bind}:${config.webhook.port}, binding gc every ${config.defaults.bindingGcMs}ms, jobs gc every ${config.retention.jobsGcMs}ms${
         recoveredJobs ? `, recovered ${recoveredJobs} stale jobs` : ""
       }`,
     );
     void this.runBindingGc();
+    void this.runJobsGc();
   }
 
   async stop(): Promise<void> {
@@ -82,6 +94,7 @@ export class PollinateDaemon {
     this.stopping = true;
     if (this.reloadTimer) clearInterval(this.reloadTimer);
     if (this.bindingGcTimer) clearInterval(this.bindingGcTimer);
+    if (this.jobsGcTimer) clearInterval(this.jobsGcTimer);
     await this.webhook?.stop();
     await this.poll?.stop();
     await this.schedule?.stop();
@@ -152,6 +165,47 @@ export class PollinateDaemon {
     }
   }
 
+  /**
+   * Job + ledger retention sweep. This is what stops ~/.pollinate/jobs/ from
+   * growing without bound the way it did before the jobs-gc incident (61,812
+   * terminal job files, unbounded readdir+JSON.parse in listJobs() at daemon
+   * start OOM'd the process). Runs on retention.jobsGcMs (default hourly) and
+   * once more at startup; failures are logged, never thrown, so a bad
+   * retention config or a transient fs error can't take the daemon down.
+   */
+  private async runJobsGc(): Promise<void> {
+    if (this.stopping || this.jobsGcRunning || !this.config) return;
+    this.jobsGcRunning = true;
+    try {
+      const retention = this.config.retention;
+      const terminalOlderThanDays = parseDuration(retention.jobsMaxAge) / MS_PER_DAY;
+      const result = await this.store.garbageCollectJobs({
+        terminalOlderThanDays,
+        keepLastPerTrigger: retention.jobsKeepLastPerTrigger,
+      });
+      if (result.deleted > 0) {
+        await this.store.appendLedger({
+          event: "pollinate.jobs.gc",
+          deleted: result.deleted,
+          kept: result.kept,
+          cutoff: result.cutoff,
+          pruned_job_uuids: result.prunedJobUuids,
+        });
+        await this.log(`jobs gc: removed ${result.deleted} terminal jobs older than ${result.cutoff} (kept ${result.kept})`);
+      }
+      const rotated = await rotateLedgerIfLarge(this.store.root, retention.ledgerMaxMb);
+      if (rotated) {
+        // Log after rotating (this line lands in the freshly recreated ledger.jsonl).
+        await this.store.appendLedger({ event: "pollinate.ledger.rotated", max_mb: retention.ledgerMaxMb });
+        await this.log(`ledger rotated: exceeded ${retention.ledgerMaxMb}MB, moved to ledger.jsonl.1`);
+      }
+    } catch (error) {
+      await this.log(`jobs gc failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.jobsGcRunning = false;
+    }
+  }
+
   private async log(message: string): Promise<void> {
     try {
       await appendTextLine(daemonLogPath(this.store.root), `${nowIso()} ${message}`);
@@ -165,10 +219,13 @@ export class PollinateDaemon {
   }
 
   private async recoverStaleJobs(now = Date.now(), staleMs = STALE_JOB_RECOVERY_MS): Promise<number> {
-    const jobs = await this.store.listJobs();
+    // statuses: NON_TERMINAL_JOB_STATUSES filters inside listJobs(), before a
+    // job is pushed into the result array — the (usually huge) terminal
+    // backlog is never held in memory here, only the handful of in-flight
+    // jobs a crash could have interrupted.
+    const jobs = await this.store.listJobs({ statuses: NON_TERMINAL_JOB_STATUSES });
     let recovered = 0;
     for (const job of jobs) {
-      if (TERMINAL_JOB_STATUSES.has(job.status)) continue;
       const touchedAt = job.startedAt ?? job.queuedAt;
       const touchedMs = new Date(touchedAt).getTime();
       if (Number.isFinite(touchedMs) && now - touchedMs < staleMs) continue;

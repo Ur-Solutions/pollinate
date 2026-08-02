@@ -28,6 +28,8 @@ export type JobRetentionOptions = {
   /** Optional safety floor that keeps the newest N terminal jobs per trigger even when older than the window. */
   keepLastPerTrigger?: number;
   now?: Date;
+  /** Compute what would be removed without unlinking anything or pruning the job-id index. */
+  dryRun?: boolean;
 };
 
 export type JobRetentionResult = {
@@ -36,6 +38,8 @@ export type JobRetentionResult = {
   kept: number;
   prunedJobUuids: number;
   deletedJobIds: string[];
+  /** Per-trigger breakdown of terminal jobs removed vs. retained. */
+  perTrigger: Record<string, { deleted: number; kept: number }>;
 };
 
 type LedgerCache = {
@@ -287,21 +291,27 @@ export class PollinateStore {
     });
   }
 
-  async listJobs(options: { status?: JobStatus; triggerId?: string; last?: number } = {}): Promise<Job[]> {
+  /**
+   * `statuses` (unlike the singular `status`) filters before jobs are pushed
+   * into the result array, so callers that only need a small status subset
+   * (e.g. daemon startup recovery scanning for non-terminal jobs) never hold
+   * every terminal job in memory at once — see recoverStaleJobs.
+   */
+  async listJobs(options: { status?: JobStatus; statuses?: JobStatus[]; triggerId?: string; last?: number } = {}): Promise<Job[]> {
     await this.ensure();
     const entries = await readdir(jobsDir(this.root)).catch(() => []);
+    const statusSet = options.statuses ? new Set(options.statuses) : undefined;
     const jobs: Job[] = [];
     for (const entry of entries.filter((item) => item.endsWith(".json"))) {
       const job = await readJsonOr<Job | null>(join(jobsDir(this.root), entry), null);
-      if (job) jobs.push(job);
+      if (!job) continue;
+      if (options.status && job.status !== options.status) continue;
+      if (statusSet && !statusSet.has(job.status)) continue;
+      if (options.triggerId && job.triggerId !== options.triggerId) continue;
+      jobs.push(job);
     }
     jobs.sort((a, b) => b.queuedAt.localeCompare(a.queuedAt));
-    const filtered = jobs.filter((job) => {
-      if (options.status && job.status !== options.status) return false;
-      if (options.triggerId && job.triggerId !== options.triggerId) return false;
-      return true;
-    });
-    return options.last ? filtered.slice(0, options.last) : filtered;
+    return options.last ? jobs.slice(0, options.last) : jobs;
   }
 
   async cancelJob(id: string): Promise<Job> {
@@ -353,17 +363,28 @@ export class PollinateStore {
       const finishedAt = job.completedAt ?? job.queuedAt;
       return new Date(finishedAt).getTime() < cutoffMs;
     });
+    const deleteSet = new Set(deleteCandidates.map((job) => job.id));
 
     const deletedJobIds: string[] = [];
     const deletedUuids: string[] = [];
     for (const job of deleteCandidates) {
-      await unlink(this.jobPath(job.id)).catch((error) => {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      });
+      if (!options.dryRun) {
+        await unlink(this.jobPath(job.id)).catch((error) => {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        });
+      }
       deletedJobIds.push(job.id);
       if (job.uuid) deletedUuids.push(job.uuid);
     }
-    const prunedJobUuids = await pruneJobIdIndex(this.root, deletedUuids);
+    const prunedJobUuids = options.dryRun ? 0 : await pruneJobIdIndex(this.root, deletedUuids);
+
+    const perTrigger: Record<string, { deleted: number; kept: number }> = {};
+    for (const job of terminal) {
+      if (!perTrigger[job.triggerId]) perTrigger[job.triggerId] = { deleted: 0, kept: 0 };
+      const bucket = perTrigger[job.triggerId];
+      if (deleteSet.has(job.id)) bucket.deleted += 1;
+      else bucket.kept += 1;
+    }
 
     return {
       cutoff,
@@ -371,6 +392,7 @@ export class PollinateStore {
       kept: jobs.length - deletedJobIds.length,
       prunedJobUuids,
       deletedJobIds,
+      perTrigger,
     };
   }
 

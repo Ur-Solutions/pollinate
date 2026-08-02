@@ -244,6 +244,17 @@ export type WebhookRelayConfig = {
   maxAgeSeconds: number;
 };
 
+export type RetentionConfig = {
+  /** Duration string (e.g. "14d"); terminal jobs older than this are eligible for GC. */
+  jobsMaxAge: string;
+  /** Safety floor: newest N terminal jobs per trigger are kept regardless of age. */
+  jobsKeepLastPerTrigger: number;
+  /** How often the daemon runs the jobs/ledger retention sweep. */
+  jobsGcMs: number;
+  /** ledger.jsonl is rotated to ledger.jsonl.1 once it exceeds this size. */
+  ledgerMaxMb: number;
+};
+
 export type DaemonConfig = {
   webhook: {
     bind: string;
@@ -259,6 +270,7 @@ export type DaemonConfig = {
     bindingGcMs: number;
   };
   execution: ExecutionProfile;
+  retention: RetentionConfig;
 };
 
 export type LedgerEvent = {

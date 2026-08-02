@@ -296,6 +296,45 @@ shell_args = ["-lc"]
     expect(config.defaults.triggerReloadMs).toBe(2_000);
     expect(config.execution).toMatchObject({ shell: "/bin/zsh", shellArgs: ["-lc"] });
   });
+
+  test("defaults [retention] to a 14-day / 50-per-trigger / hourly / 64MB policy", () => {
+    expect(DEFAULT_DAEMON_CONFIG.retention).toEqual({
+      jobsMaxAge: "14d",
+      jobsKeepLastPerTrigger: 50,
+      jobsGcMs: 3_600_000,
+      ledgerMaxMb: 64,
+    });
+    expect(parseDaemonConfigToml(null).retention).toEqual(DEFAULT_DAEMON_CONFIG.retention);
+  });
+
+  test("parses [retention] overrides in both camelCase and snake_case", () => {
+    const camel = parseDaemonConfigToml(`[retention]
+jobsMaxAge = "7d"
+jobsKeepLastPerTrigger = 10
+jobsGcMs = 60000
+ledgerMaxMb = 8
+`);
+    expect(camel.retention).toEqual({ jobsMaxAge: "7d", jobsKeepLastPerTrigger: 10, jobsGcMs: 60_000, ledgerMaxMb: 8 });
+
+    const snake = parseDaemonConfigToml(`[retention]
+jobs_max_age = "3d"
+jobs_keep_last_per_trigger = 5
+jobs_gc_ms = 45000
+ledger_max_mb = 4
+`);
+    expect(snake.retention).toEqual({ jobsMaxAge: "3d", jobsKeepLastPerTrigger: 5, jobsGcMs: 45_000, ledgerMaxMb: 4 });
+  });
+
+  test("floors and clamps a negative jobsKeepLastPerTrigger to 0", () => {
+    const config = parseDaemonConfigToml(`[retention]
+jobsKeepLastPerTrigger = -5.7
+`);
+    expect(config.retention.jobsKeepLastPerTrigger).toBe(0);
+  });
+
+  test("rejects an invalid retention.jobsMaxAge duration", () => {
+    expect(() => parseDaemonConfigToml(`[retention]\njobsMaxAge = "not-a-duration"\n`)).toThrow(/Invalid duration/);
+  });
 });
 
 describe("slugify", () => {

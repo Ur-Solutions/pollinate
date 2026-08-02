@@ -36,6 +36,7 @@ pollinate --help
   state/router-bindings/<trigger>/<subject>.lock
   jobs/<jobId>.json
   ledger.jsonl
+  ledger.jsonl.1
   daemon.log
   daemon.out.log
   daemon.err.log
@@ -58,9 +59,14 @@ pollinate list
 pollinate trigger my-trigger --dry-run
 pollinate trigger my-trigger --payload '{"source":"manual"}'
 pollinate jobs --last 10
+pollinate jobs gc --dry-run
 pollinate status
 pollinate ledger -n 20
 ```
+
+The daemon prunes old terminal job files and rotates `ledger.jsonl` on its own
+(see `[retention]` below and `AGENTS.md` → "Job retention"). Run the same sweep
+by hand with `pollinate jobs gc [--max-age <dur>] [--keep-last <n>] [--dry-run]`.
 
 Run the daemon in the foreground:
 
@@ -103,6 +109,28 @@ Install it as a user service on macOS or Linux:
 pollinate daemon install
 pollinate daemon status
 pollinate daemon logs
+```
+
+## Job Retention
+
+`jobs/<jobId>.json` accumulates one file per execution. The daemon prunes
+terminal jobs (`completed`, `errored`, `timed-out`, `cancelled`) — never
+`queued`/`resolving-context`/`running` ones — on an hourly sweep, and rotates
+`ledger.jsonl` once it grows past a size cap:
+
+```toml
+[retention]
+jobsMaxAge = "14d"           # terminal jobs older than this are GC-eligible
+jobsKeepLastPerTrigger = 50  # always keep the newest N terminal jobs per trigger
+jobsGcMs = 3600000           # sweep interval, ms (default: hourly)
+ledgerMaxMb = 64             # rotate ledger.jsonl -> ledger.jsonl.1 past this size
+```
+
+Run the same sweep manually, e.g. to check what it would do first:
+
+```sh
+pollinate jobs gc --dry-run
+pollinate jobs gc --max-age 7d --keep-last 20
 ```
 
 ## Webhook Satellites

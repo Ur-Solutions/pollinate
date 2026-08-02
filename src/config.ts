@@ -15,6 +15,7 @@ import type {
   PollCursor,
   PollFetch,
   PollSpec,
+  RetentionConfig,
   RouterConfig,
   ScheduleTiming,
   Source,
@@ -38,6 +39,12 @@ export const DEFAULT_DAEMON_CONFIG: DaemonConfig = {
     inheritEnv: true,
     env: {},
   },
+  retention: {
+    jobsMaxAge: "14d",
+    jobsKeepLastPerTrigger: 50,
+    jobsGcMs: 3_600_000,
+    ledgerMaxMb: 64,
+  },
 };
 
 export function parseTriggerToml(text: string, fallbackId?: string): Trigger {
@@ -57,6 +64,7 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
   const relay = asOptionalRecord(webhook.relay) ?? {};
   const defaults = asOptionalRecord(doc.defaults) ?? {};
   const execution = asOptionalRecord(doc.execution) ?? {};
+  const retention = asOptionalRecord(doc.retention) ?? {};
   return {
     webhook: {
       bind: stringOr(webhook.bind, DEFAULT_DAEMON_CONFIG.webhook.bind),
@@ -72,6 +80,21 @@ export function parseDaemonConfigToml(text: string | null): DaemonConfig {
       bindingGcMs: numberOr(defaults.bindingGcMs ?? defaults.binding_gc_ms, DEFAULT_DAEMON_CONFIG.defaults.bindingGcMs),
     },
     execution: normalizeExecution(execution),
+    retention: normalizeRetention(retention),
+  };
+}
+
+function normalizeRetention(raw: AnyRecord): RetentionConfig {
+  const jobsMaxAge = stringOr(raw.jobsMaxAge ?? raw.jobs_max_age, DEFAULT_DAEMON_CONFIG.retention.jobsMaxAge);
+  parseDuration(jobsMaxAge);
+  return {
+    jobsMaxAge,
+    jobsKeepLastPerTrigger: Math.max(
+      0,
+      Math.floor(numberOr(raw.jobsKeepLastPerTrigger ?? raw.jobs_keep_last_per_trigger, DEFAULT_DAEMON_CONFIG.retention.jobsKeepLastPerTrigger)),
+    ),
+    jobsGcMs: numberOr(raw.jobsGcMs ?? raw.jobs_gc_ms, DEFAULT_DAEMON_CONFIG.retention.jobsGcMs),
+    ledgerMaxMb: numberOr(raw.ledgerMaxMb ?? raw.ledger_max_mb, DEFAULT_DAEMON_CONFIG.retention.ledgerMaxMb),
   };
 }
 
