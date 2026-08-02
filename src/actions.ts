@@ -1,10 +1,11 @@
 import type { Action, Activation, DryRunResult, ExecutionProfile, Job, JsonValue, SourceKind, Trigger } from "./types.js";
-import { PollinateStore } from "./store.js";
+import type { PollinateStore } from "./store.js";
 import { resolveContext } from "./context.js";
 import { renderAction, renderString } from "./templates.js";
 import { execArgv, execShell, type ExecResult } from "./process.js";
 import { nowIso, parseDuration } from "./time.js";
 import { executeRouter } from "./router.js";
+import { CombActionError, executeCombRun } from "./comb-transport.js";
 
 export type ActionExecutorOptions = {
   contextTimeoutMs: number;
@@ -13,6 +14,11 @@ export type ActionExecutorOptions = {
 };
 
 export type ActionResult = { timedOut?: boolean; handle?: string; handles?: Record<string, string>; [key: string]: unknown };
+
+type ActionExecutionContext = {
+  triggerId: string;
+  deliveryId: string;
+};
 
 export class ActionExecutor {
   constructor(
@@ -70,21 +76,24 @@ export class ActionExecutor {
     if (cancellation?.status === "cancelled") return cancellation;
     if (trigger.router && !job.action) return this.executeRouterJob(job, trigger, activation, batch);
     await this.store.updateJob(job.id, { status: "resolving-context" });
-    const jobCwd = job.cwd ?? trigger.cwd;
-    const resolved = await this.buildContext(trigger, activation, batch, jobCwd);
-    if (!job.action) throw new Error(`Job ${job.id} has no action`);
-    const rendered = this.renderJobInputs(job.action, jobCwd, resolved.context);
-    const warnings = resolved.warnings.concat(rendered.warnings);
-    const running = await this.store.updateJob(job.id, {
-      status: "running",
-      cwd: rendered.cwd,
-      context: resolved.context,
-      action: rendered.action,
-      startedAt: nowIso(),
-    });
-    await this.store.appendLedger({ event: "pollinate.job.started", job_id: job.id, trigger_id: trigger.id, action_kind: rendered.action.kind, cwd: rendered.cwd });
     try {
-      const result = await this.executeAction(rendered.action, rendered.cwd);
+      const jobCwd = job.cwd ?? trigger.cwd;
+      const resolved = await this.buildContext(trigger, activation, batch, jobCwd);
+      if (!job.action) throw new Error(`Job ${job.id} has no action`);
+      const rendered = this.renderJobInputs(job.action, jobCwd, resolved.context);
+      const warnings = resolved.warnings.concat(rendered.warnings);
+      const running = await this.store.updateJob(job.id, {
+        status: "running",
+        cwd: rendered.cwd,
+        context: resolved.context,
+        action: rendered.action,
+        startedAt: nowIso(),
+      });
+      await this.store.appendLedger({ event: "pollinate.job.started", job_id: job.id, trigger_id: trigger.id, action_kind: rendered.action.kind, cwd: rendered.cwd });
+      const result = await this.executeAction(rendered.action, rendered.cwd, {
+        triggerId: trigger.id,
+        deliveryId: combDeliveryId(job, activation),
+      });
       const completed = await this.store.updateJob(job.id, {
         status: result.timedOut ? "timed-out" : "completed",
         result,
@@ -101,8 +110,20 @@ export class ActionExecutor {
       return completed;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const errored = await this.store.updateJob(job.id, { status: "errored", error: message, completedAt: nowIso() });
-      await this.store.appendLedger({ event: "pollinate.job.errored", job_id: job.id, trigger_id: trigger.id, error: message });
+      const combResult = error instanceof CombActionError ? error.result : undefined;
+      const errored = await this.store.updateJob(job.id, {
+        status: "errored",
+        ...(combResult ? { result: combResult } : {}),
+        error: message,
+        completedAt: nowIso(),
+      });
+      await this.store.appendLedger({
+        event: "pollinate.job.errored",
+        job_id: job.id,
+        trigger_id: trigger.id,
+        error: message,
+        ...(combResult ? { retryable: combResult.retryable, comb_error: combResult.error } : {}),
+      });
       return errored;
     }
   }
@@ -166,9 +187,9 @@ export class ActionExecutor {
     };
   }
 
-  async executeAction(action: Action, cwd?: string): Promise<ActionResult> {
+  async executeAction(action: Action, cwd?: string, executionContext?: ActionExecutionContext): Promise<ActionResult> {
     if (action.kind === "sequence") {
-      return this.executeSequence(action, cwd);
+      return this.executeSequence(action, cwd, executionContext);
     }
     if (action.kind === "command") {
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
@@ -196,7 +217,7 @@ export class ActionExecutor {
       }
     }
     if (action.kind === "honeybee") {
-      return this.executeHoneybee(action, cwd);
+      return this.executeHoneybee(action, cwd, executionContext);
     }
     if (action.kind === "hermes") {
       return this.executeHermes(action, cwd);
@@ -217,12 +238,19 @@ export class ActionExecutor {
     throw new Error(`Unsupported action: ${JSON.stringify(neverAction)}`);
   }
 
-  private async executeSequence(action: Extract<Action, { kind: "sequence" }>, cwd?: string): Promise<ActionResult> {
+  private async executeSequence(
+    action: Extract<Action, { kind: "sequence" }>,
+    cwd?: string,
+    executionContext?: ActionExecutionContext,
+  ): Promise<ActionResult> {
     const continueOnError = action.continueOnError === true;
     const runStep = async (step: (typeof action.actions)[number], index: number) => {
       const id = step.id ?? String(index + 1);
       try {
-        const result = await this.executeAction(step.action, cwd);
+        const stepContext = executionContext
+          ? { ...executionContext, deliveryId: `${executionContext.deliveryId}.s${index + 1}` }
+          : undefined;
+        const result = await this.executeAction(step.action, cwd, stepContext);
         return { id, action: step.action.kind, result };
       } catch (error) {
         if (!continueOnError) throw error;
@@ -243,20 +271,51 @@ export class ActionExecutor {
       }
     }
     const handle = (action.primary ? handles[action.primary] : undefined) ?? Object.values(handles)[0];
+    const primaryResult = action.primary
+      ? results.find((step) => step.id === action.primary)
+      : results.find((step) => "result" in step && typeof step.result?.runId === "string");
+    const primaryActionResult = primaryResult && "result" in primaryResult ? primaryResult.result : undefined;
+    const runId = primaryActionResult && typeof primaryActionResult.runId === "string"
+      ? primaryActionResult.runId
+      : undefined;
     return {
       results,
       ...(Object.keys(handles).length ? { handles } : {}),
       ...(handle ? { handle } : {}),
+      ...(runId ? { runId } : {}),
     };
   }
 
-  private executeHoneybee(action: Extract<Action, { kind: "honeybee" }>, cwd?: string): Promise<ActionResult> {
+  private async executeHoneybee(
+    action: Extract<Action, { kind: "honeybee" }>,
+    cwd?: string,
+    executionContext?: ActionExecutionContext,
+  ): Promise<ActionResult> {
+    if (action.run === "comb") {
+      if (!executionContext) throw new Error("Comb actions require Pollinate trigger provenance");
+      const result = await executeCombRun(action, cwd, executionContext, {
+        timeoutMs: this.options.commandTimeoutMs,
+        execution: this.options.execution,
+      });
+      if (result.created && !result.replayedDelivery) {
+        await this.store.appendLedger({
+          event: "pollinate.comb.run_started",
+          trigger_id: executionContext.triggerId,
+          delivery_id: executionContext.deliveryId,
+          event_id: executionContext.deliveryId,
+          comb: action.comb,
+          version: action.version,
+          run_id: result.runId,
+        });
+      }
+      return result;
+    }
     if (action.run === "flow") {
       const args = Object.entries(action.args ?? {}).flatMap(([key, value]) => ["--arg", `${key}=${value}`]);
       return this.execHive(["flow", "run", action.flow, ...args], "hive flow run", { cwd });
     }
     if (action.run === "loop") {
-      const loop = cwd && !Object.prototype.hasOwnProperty.call(action.loop, "cwd") ? { ...action.loop, cwd } : action.loop;
+      const loop = cwd && !Object.hasOwn(action.loop, "cwd") ? { ...action.loop, cwd } : action.loop;
       return this.execHive(["loop", "start", ...flagsFromRecord(loop)], "hive loop start", { cwd });
     }
     if (action.run === "spawn") {
@@ -408,4 +467,10 @@ export function parseHiveHandle(stdout: string): string | undefined {
 
 export function sourceKindForTrigger(trigger: Trigger, fallback: SourceKind = "manual"): SourceKind {
   return trigger.source.kind === "manual" ? fallback : trigger.source.kind;
+}
+
+function combDeliveryId(job: Job, activation: Activation): string {
+  const providerDeliveryId = activation.metadata?.deliveryId;
+  if (!providerDeliveryId) return job.uuid ?? job.id;
+  return `pollinate:${job.triggerId}:${activation.source}:${encodeURIComponent(providerDeliveryId)}`;
 }

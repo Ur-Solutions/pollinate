@@ -336,6 +336,10 @@ function normalizeRouter(raw: AnyRecord | undefined): RouterConfig | undefined {
   const onOpen = normalizeAction(asRecord(raw.onOpen ?? raw.on_open, "trigger.router.onOpen"));
   const onActivity = normalizeAction(asRecord(raw.onActivity ?? raw.on_activity, "trigger.router.onActivity"));
   const onCloseRaw = asOptionalRecord(raw.onClose ?? raw.on_close);
+  const onClose = onCloseRaw ? normalizeAction(onCloseRaw) : undefined;
+  if ([onOpen, onActivity, onClose].some((action) => action && containsCombAction(action))) {
+    throw new Error("Comb actions are not supported in router actions until run bindings land");
+  }
   return {
     plugin,
     openOn,
@@ -344,8 +348,13 @@ function normalizeRouter(raw: AnyRecord | undefined): RouterConfig | undefined {
     idleTtl: optionalString(raw.idleTtl ?? raw.idle_ttl),
     onOpen,
     onActivity,
-    onClose: onCloseRaw ? normalizeAction(onCloseRaw) : undefined,
+    onClose,
   };
+}
+
+function containsCombAction(action: Action): boolean {
+  if (action.kind === "honeybee") return action.run === "comb";
+  return action.kind === "sequence" && action.actions.some((step) => containsCombAction(step.action));
 }
 
 function normalizeAction(raw: AnyRecord): Action {
@@ -385,6 +394,29 @@ function normalizeAction(raw: AnyRecord): Action {
   }
   if (kind === "honeybee") {
     const run = stringOr(raw.run, "");
+    if (run === "comb") {
+      const comb = requiredLiteralString(raw.comb, "trigger.action.comb");
+      const product = requiredLiteralString(raw.product, "trigger.action.product");
+      const version = Number(raw.version);
+      if (!Number.isSafeInteger(version) || version <= 0) {
+        throw new Error("trigger.action.version must be a positive safe integer");
+      }
+      const collision = optionalString(raw.collision);
+      if (collision !== undefined && collision !== "refuse" && collision !== "join-existing") {
+        throw new Error(`Unsupported Comb collision mode: ${collision}`);
+      }
+      if (raw.input === undefined) throw new Error("Missing required table: trigger.action.input");
+      const input = normalizeJsonObject(asRecord(raw.input, "trigger.action.input"), "trigger.action.input");
+      return {
+        kind,
+        run,
+        comb,
+        version,
+        product,
+        input,
+        ...(collision ? { collision } : {}),
+      };
+    }
     if (run === "flow") {
       return { kind, run, flow: requiredString(raw.flow, "trigger.action.flow"), args: stringRecord(asOptionalRecord(raw.args)) };
     }
@@ -596,6 +628,31 @@ function requiredString(value: unknown, label: string): string {
   const out = optionalString(value);
   if (!out) throw new Error(`Missing required string: ${label}`);
   return out;
+}
+
+function requiredLiteralString(value: unknown, label: string): string {
+  const out = requiredString(value, label);
+  if (out.includes("{{") || out.includes("}}")) {
+    throw new Error(`${label} must be literal and cannot contain template placeholders`);
+  }
+  return out;
+}
+
+function normalizeJsonObject(value: AnyRecord, label: string): Record<string, JsonValue> {
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, normalizeJsonValue(item, `${label}.${key}`)]),
+  );
+}
+
+function normalizeJsonValue(value: unknown, label: string): JsonValue {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error(`Expected finite JSON number at ${label}`);
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((item, index) => normalizeJsonValue(item, `${label}[${index}]`));
+  if (typeof value === "object") return normalizeJsonObject(value as AnyRecord, label);
+  throw new Error(`Expected JSON value at ${label}`);
 }
 
 function optionalString(value: unknown): string | undefined {

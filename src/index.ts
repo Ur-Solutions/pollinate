@@ -1,4 +1,5 @@
 export * from "./actions.js";
+export * from "./comb-transport.js";
 export * from "./config.js";
 export * from "./context.js";
 export * from "./daemon.js";

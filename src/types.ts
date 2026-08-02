@@ -55,6 +55,20 @@ export type Delivery = {
 
 export type BuzTier = "interrupt" | "queue" | "passive";
 
+export type CombRunAction = {
+  kind: "honeybee";
+  run: "comb";
+  /** Immutable registry name. Comb control fields are never template-rendered. */
+  comb: string;
+  /** Immutable positive registry version. */
+  version: number;
+  /** Explicit Honeybee product identity; cwd inference is forbidden. */
+  product: string;
+  /** The one JSON object written to `hive comb run --input -`. */
+  input: JsonObject;
+  collision?: "refuse" | "join-existing";
+};
+
 export type HoneybeeAction =
   | { kind: "honeybee"; run: "flow"; flow: string; args?: Record<string, string> }
   | { kind: "honeybee"; run: "loop"; loop: Record<string, JsonValue> }
@@ -74,7 +88,48 @@ export type HoneybeeAction =
     }
   | { kind: "honeybee"; run: "send"; target: string; message: string; timeout?: string }
   | { kind: "honeybee"; run: "buz"; target: string; message: string; tier?: BuzTier; subject?: string; senderHuman?: string; timeout?: string }
-  | { kind: "honeybee"; run: "kill"; target: string; timeout?: string };
+  | { kind: "honeybee"; run: "kill"; target: string; timeout?: string }
+  | CombRunAction;
+
+export type CombCliErrorCode =
+  | "invalid_argument"
+  | "not_found"
+  | "version_conflict"
+  | "claim_conflict"
+  | "ambiguous_activation"
+  | "cancelled"
+  | "approval_required"
+  | "effect_ambiguous"
+  | "external_dependency"
+  | "corrupt_state";
+
+export type CombRunJobSuccess = {
+  deliveryId: string;
+  runId: string;
+  comb: string;
+  version: number;
+  created: boolean;
+  joinedExisting: boolean;
+  replayedDelivery: boolean;
+  intakeReady: boolean;
+};
+
+export type CombRunJobFailure = {
+  deliveryId: string;
+  comb: string;
+  version: number;
+  retryable: boolean;
+  exitCode: number | null;
+  error: {
+    code: CombCliErrorCode | "transport_failure" | "invalid_envelope";
+    message: string;
+    details?: JsonValue;
+  };
+  /** Present only for a canonical claim-conflict refusal. This is not a successful run back-reference. */
+  holdingRunId?: string;
+};
+
+export type CombRunJobResult = CombRunJobSuccess | CombRunJobFailure;
 
 export type ActionStep = {
   id?: string;
@@ -169,6 +224,8 @@ export type Activation = {
   payload: JsonValue;
   receivedAt: string;
   metadata?: {
+    /** Provider delivery key, when one exists; keeps action replay stable across intake redelivery. */
+    deliveryId?: string;
     webhook?: {
       path?: string;
       headers?: Record<string, string>;
