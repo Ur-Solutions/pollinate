@@ -130,16 +130,12 @@ function stripNoopStdinDrain(script: string): string {
 }
 
 function defaultHiveScript(logPath: string): string {
+  // v2 shape (cutover 2026-08-19): `hive spawn <name> --agent <a> --json`
+  // prints one JSON object whose beeId is the canonical id.
   return `#!/bin/sh
 echo "$@" >> "${logPath}"
 if [ "$1" = "spawn" ]; then
-  name="spawned"
-  prev=""
-  for arg in "$@"; do
-    if [ "$prev" = "--name" ]; then name="$arg"; fi
-    prev="$arg"
-  done
-  printf '%s\\tcodex\\t/tmp\\tlocal\\n' "$name"
+  printf '{"beeId":"%s","commandId":1}\\n' "$2"
 fi
 `;
 }

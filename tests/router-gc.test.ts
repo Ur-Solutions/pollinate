@@ -55,7 +55,7 @@ describe("router binding gc", () => {
         expect(result.expired).toHaveLength(1);
         const updated = await store.getRouterBinding(trig.id, "github:pull_request:trmd/demo#5");
         expect(updated?.status).toBe("closed");
-        expect(await hive.log()).toContain("kill pr-5");
+        expect(await hive.log()).toContain("stop pr-5");
         const ledger = (await store.readLedger()).join("\n");
         expect(ledger).toContain("pollinate.router.binding_expired");
         expect(ledger).toContain("idle-ttl");
@@ -108,7 +108,7 @@ describe("router binding gc", () => {
         expect(result.retried).toHaveLength(1);
         const updated = await store.getRouterBinding(trig.id, "github:pull_request:trmd/demo#5");
         expect(updated).toMatchObject({ status: "active", target: { handle: "pr-5" } });
-        expect(await hive.log()).toContain("spawn codex --name pr-5");
+        expect(await hive.log()).toContain("spawn pr-5 --agent codex --json");
         expect((await store.readLedger()).join("\n")).toContain("pollinate.router.binding_retry");
       } finally {
         hive.restore();
@@ -193,7 +193,7 @@ describe("router binding gc", () => {
         expect(result.reconciled).toHaveLength(1);
         const updated = await store.getRouterBinding(trig.id, "github:pull_request:trmd/demo#5");
         expect(updated?.status).toBe("closed");
-        expect(await hive.log()).toContain("kill pr-5");
+        expect(await hive.log()).toContain("stop pr-5");
         expect(await store.readLedger().then((lines) => lines.join("\n"))).toContain("pollinate.router.binding_reconciled");
         const gh = await import("node:fs/promises").then((fs) => fs.readFile(ghLog, "utf8"));
         expect(gh).toContain("pr view 5 --repo trmd/demo --json state");
@@ -259,7 +259,7 @@ describe("router binding gc", () => {
         expect(result.reconciled).toHaveLength(1);
         const updated = await store.getRouterBinding(trig.id, "custom:thing#1");
         expect(updated?.status).toBe("closed");
-        expect(await hive.log()).toContain("kill thing-1");
+        expect(await hive.log()).toContain("stop thing-1");
       } finally {
         hive.restore();
       }

@@ -311,28 +311,35 @@ export class ActionExecutor {
       return result;
     }
     if (action.run === "flow") {
-      const args = Object.entries(action.args ?? {}).flatMap(([key, value]) => ["--arg", `${key}=${value}`]);
-      return this.execHive(["flow", "run", action.flow, ...args], "hive flow run", { cwd });
+      // hive flows were retired in the v2 cutover (2026-08-19): the reset has
+      // no flow engine. Loud refusal beats a silent unknown-verb spawn.
+      throw new Error(
+        "honeybee-flow is a pre-reset action: hive flows no longer exist (v2 cutover 2026-08-19). " +
+          "Rewrite this trigger to run=spawn (a coordinator bee owns the fan-out) or run=send.",
+      );
     }
     if (action.run === "loop") {
-      const loop = cwd && !Object.hasOwn(action.loop, "cwd") ? { ...action.loop, cwd } : action.loop;
-      return this.execHive(["loop", "start", ...flagsFromRecord(loop)], "hive loop start", { cwd });
+      throw new Error(
+        "honeybee-loop is a pre-reset action: hive loops no longer exist (v2 cutover 2026-08-19). " +
+          "Rewrite this trigger to run=spawn with a self-looping prompt, or a schedule trigger + run=send.",
+      );
     }
     if (action.run === "spawn") {
       const spawnCwd = action.cwd ?? cwd;
-      const flags = flagsFromRecord({
-        ...(action.name ? { name: action.name } : {}),
-        ...(action.colony ? { colony: action.colony } : {}),
-        ...(action.home ? { home: action.home } : {}),
-        ...(spawnCwd ? { cwd: spawnCwd } : {}),
-        ...(action.yolo === true ? { yolo: true } : {}),
-      });
-      if (action.yolo === false) flags.push("--no-yolo");
-      if (action.acceptTrust === false) flags.push("--no-accept-trust");
-      const beeArgs = action.args?.length ? ["--", ...action.args] : [];
+      // v2 grammar (cutover 2026-08-19): name is positional, harness is
+      // --agent, colonies become tags, a home IS an account id, and --yolo
+      // maps to the harness's own bypass flag as a per-bee arg (kept across
+      // revives). acceptTrust is moot — v2 seeds harness trust at spawn.
+      const name = action.name ?? `pol-${(executionContext?.deliveryId ?? Date.now().toString(36)).replace(/[^A-Za-z0-9._:-]+/g, "-")}`;
+      const v2Args = ["spawn", name, "--agent", action.bee, "--json"];
+      if (spawnCwd) v2Args.push("--cwd", spawnCwd);
+      if (action.colony) v2Args.push("--tag", `colony=${action.colony}`);
+      if (action.home) v2Args.push("--account", action.home);
+      const bypass = action.yolo === true ? HARNESS_BYPASS_ARGS[action.bee] : undefined;
+      for (const beeArg of [...(bypass ?? []), ...(action.args ?? [])]) v2Args.push("--arg", beeArg);
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-      return this.execHive(["spawn", action.bee, ...flags, ...beeArgs], "hive spawn", { cwd: spawnCwd, timeoutMs }).then(async (result) => {
-        const handle = parseHiveHandle(result.stdout) ?? (isValidHiveHandle(action.name) ? action.name : undefined);
+      return this.execHive(v2Args, "hive spawn", { cwd: spawnCwd, timeoutMs }).then(async (result) => {
+        const handle = parseV2SpawnBeeId(result.stdout) ?? (isValidHiveHandle(action.name) ? action.name : undefined);
         if (!handle) {
           throw new Error(`hive spawn did not return a parsable target handle; stdout: ${JSON.stringify(String(result.stdout).slice(0, 200))}`);
         }
@@ -349,6 +356,10 @@ export class ActionExecutor {
     }
     if (action.run === "buz") {
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
+      // v2's buz compat has no --subject; fold it into the body. Tiers map
+      // onto delivery urgency daemon-side (interrupt→now, next-tool→next,
+      // queue/passive→idle).
+      const message = action.subject ? `[${action.subject}] ${action.message}` : action.message;
       const args = [
         "buz",
         "send",
@@ -357,15 +368,17 @@ export class ActionExecutor {
         action.senderHuman ?? "pollinate",
         "--tier",
         action.tier ?? "queue",
-        ...(action.subject ? ["--subject", action.subject] : []),
         "-p",
-        action.message,
+        message,
       ];
       return this.execHive(args, "hive buz send", { cwd, timeoutMs });
     }
     if (action.run === "kill") {
+      // v2 split kill into stop (end the process; the bee stays revivable)
+      // and delete (irreversible purge). Automation must never purge records:
+      // kill maps to stop.
       const timeoutMs = parseDuration(action.timeout, this.options.commandTimeoutMs);
-      return this.execHive(["kill", action.target], "hive kill", { cwd, timeoutMs });
+      return this.execHive(["stop", action.target], "hive stop", { cwd, timeoutMs });
     }
     const neverAction: never = action;
     throw new Error(`Unsupported honeybee action: ${JSON.stringify(neverAction)}`);
@@ -441,13 +454,29 @@ async function runSequence<T, R>(items: T[], fn: (item: T, index: number) => Pro
   return out;
 }
 
-function flagsFromRecord(record: Record<string, JsonValue | undefined>): string[] {
-  return Object.entries(record).flatMap(([key, value]) => {
-    if (value === undefined || value === null) return [];
-    const flag = `--${key.replace(/[A-Z]/g, (char) => `-${char.toLowerCase()}`)}`;
-    if (typeof value === "boolean") return value ? [flag] : [];
-    return [flag, String(value)];
-  });
+/** Old --yolo, per harness: the bypass flag rides as a per-bee arg in v2. */
+const HARNESS_BYPASS_ARGS: Record<string, string[]> = {
+  claude: ["--dangerously-skip-permissions"],
+  codex: ["--dangerously-bypass-approvals-and-sandbox"],
+};
+
+/**
+ * v2 `hive spawn --json` prints one JSON object with the bee's canonical id.
+ * (The old first-token scrape would happily return the word "spawned" from
+ * v2's human output — silently wrong, hence the explicit JSON contract.)
+ */
+export function parseV2SpawnBeeId(stdout: string): string | undefined {
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as { beeId?: unknown };
+      if (typeof parsed.beeId === "string" && parsed.beeId.length > 0) return parsed.beeId;
+    } catch {
+      // not a JSON line; keep scanning
+    }
+  }
+  return undefined;
 }
 
 const HIVE_HANDLE_RE = /^[A-Za-z0-9._:-]+$/;

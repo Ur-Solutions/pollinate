@@ -357,7 +357,7 @@ export default {
           });
           await waitForTerminalJobs(store, 2);
           const logAfterDuplicateOpen = await hive.log();
-          expect(logAfterDuplicateOpen.match(/spawn codex/g)).toHaveLength(1);
+          expect(logAfterDuplicateOpen.match(/--agent codex/g)).toHaveLength(1);
 
           await fetch(url, {
             method: "POST",
@@ -432,13 +432,13 @@ export default {
           expect(binding?.status).toBe("closed");
 
           const log = await hive.log();
-          expect(log).toContain("spawn codex --name pr-trmd-pollinate-123");
-          expect(log).toContain("--no-yolo -- --allowedTools Read");
-          expect(log.match(/spawn codex/g)).toHaveLength(2);
-          expect(log.match(/kill pr-trmd-pollinate-123/g)).toHaveLength(2);
+          expect(log).toContain("spawn pr-trmd-pollinate-123 --agent codex --json");
+          expect(log).toContain("--arg --allowedTools --arg Read"); // v2: per-bee args; --no-yolo = the v2 default (approvals on)
+          expect(log.match(/--agent codex/g)).toHaveLength(2);
+          expect(log.match(/stop pr-trmd-pollinate-123/g)).toHaveLength(2);
           expect(log).toContain("send pr-trmd-pollinate-123 Review trmd/pollinate#123: Add router");
-          expect(log).toContain("buz send pr-trmd-pollinate-123 --sender-human pollinate --tier queue --subject github.issue_comment.created");
-          expect(log).toContain("kill pr-trmd-pollinate-123");
+          expect(log).toContain("buz send pr-trmd-pollinate-123 --sender-human pollinate --tier queue -p [github.issue_comment.created]");
+          expect(log).toContain("stop pr-trmd-pollinate-123");
           const ledger = (await store.readLedger()).map((line) => JSON.parse(line) as Record<string, unknown>);
           expect(ledger).toEqual(
             expect.arrayContaining([
@@ -634,12 +634,12 @@ export default {
           binding = await store.getRouterBinding("github-pr-swarm", "github:pull_request:trmd/pollinate#456");
           expect(binding?.status).toBe("closed");
           const log = await hive.log();
-          expect(log).toContain("spawn claude --name claude-456");
-          expect(log).toContain("spawn grok --name grok-456");
+          expect(log).toContain("spawn claude-456 --agent claude --json");
+          expect(log).toContain("spawn grok-456 --agent grok --json");
           expect(log).toContain("send claude-456");
           expect(log).toContain("send grok-456");
-          expect(log).toContain("kill claude-456");
-          expect(log).toContain("kill grok-456");
+          expect(log).toContain("stop claude-456");
+          expect(log).toContain("stop grok-456");
         } finally {
           await server.stop();
           await delivery.shutdown();
