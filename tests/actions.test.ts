@@ -63,7 +63,7 @@ describe("ActionExecutor honeybee argv execution", () => {
           tier: "interrupt",
           subject: "ci failed",
         });
-        expect(await hive.log()).toContain("buz send bee-2 --sender-human pollinate --tier interrupt --subject ci failed -p hello there");
+        expect(await hive.log()).toContain("buz send bee-2 --sender-human pollinate --tier interrupt -p [ci failed] hello there");
       } finally {
         hive.restore();
       }
@@ -84,7 +84,7 @@ describe("ActionExecutor honeybee argv execution", () => {
         });
         expect(result.handle).toBe("review-1");
         const log = await hive.log();
-        expect(log).toContain("spawn codex --name review-1");
+        expect(log).toContain("spawn review-1 --agent codex --json");
         expect(log).toContain("send review-1 start reviewing");
       } finally {
         hive.restore();
@@ -134,7 +134,7 @@ describe("ActionExecutor honeybee argv execution", () => {
         const executor = new ActionExecutor(store, { contextTimeoutMs: 1000, commandTimeoutMs: 1000 });
         await expect(
           executor.executeAction({ kind: "honeybee", run: "kill", target: "ghost" }),
-        ).rejects.toThrow(/hive kill exited 3: no such bee/);
+        ).rejects.toThrow(/hive stop exited 3: no such bee/);
       } finally {
         hive.restore();
       }

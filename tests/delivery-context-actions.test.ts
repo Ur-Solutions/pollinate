@@ -455,25 +455,25 @@ describe("context and actions", () => {
           action: { kind: "honeybee", run: "flow", flow: "review", args: { topic: "{{topic}}" } },
           context: { static: { topic: "auth" } },
         });
+        // flows/loops were retired in the hive v2 cutover (2026-08-19):
+        // the actions now fail LOUDLY with rewrite guidance and never shell
+        // out to hive — a silent unknown-verb spawn would be worse.
         const flowActivation = { triggerId: "flow", source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
         const flowJob = await executor.createQueuedJob(flow, flowActivation, [{}]);
         await store.saveJob(flowJob);
-        expect((await executor.executeJob(flowJob, flow, flowActivation, [{}])).status).toBe("completed");
-        expect(await readFile(hiveLog, "utf8")).toContain("flow run review --arg topic=auth");
+        const flowResult = await executor.executeJob(flowJob, flow, flowActivation, [{}]);
+        expect(flowResult.status).toBe("errored");
+        expect(String(flowResult.error ?? "")).toMatch(/honeybee-flow is a pre-reset action/);
 
         const loop = trigger({ id: "loop", action: { kind: "honeybee", run: "loop", loop: { bee: "codex", cwd: root, max: 2 } } });
         const loopActivation = { triggerId: "loop", source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
         const loopJob = await executor.createQueuedJob(loop, loopActivation, [{}]);
         await store.saveJob(loopJob);
-        expect((await executor.executeJob(loopJob, loop, loopActivation, [{}])).status).toBe("completed");
-        expect(await readFile(hiveLog, "utf8")).toContain(`loop start --bee codex --cwd ${root} --max 2`);
-
-        const defaultLoop = trigger({ id: "loop-default", cwd: root, action: { kind: "honeybee", run: "loop", loop: { bee: "codex", max: 2 } } });
-        const defaultLoopActivation = { triggerId: "loop-default", source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
-        const defaultLoopJob = await executor.createQueuedJob(defaultLoop, defaultLoopActivation, [{}]);
-        await store.saveJob(defaultLoopJob);
-        expect((await executor.executeJob(defaultLoopJob, defaultLoop, defaultLoopActivation, [{}])).status).toBe("completed");
-        expect(await readFile(hiveLog, "utf8")).toContain(`loop start --bee codex --max 2 --cwd ${root}`);
+        const loopResult = await executor.executeJob(loopJob, loop, loopActivation, [{}]);
+        expect(loopResult.status).toBe("errored");
+        expect(String(loopResult.error ?? "")).toMatch(/honeybee-loop is a pre-reset action/);
+        expect(await readFile(hiveLog, "utf8").catch(() => "")).not.toContain("flow run");
+        expect(await readFile(hiveLog, "utf8").catch(() => "")).not.toContain("loop start");
 
         const hermes = trigger({ id: "hermes", action: { kind: "hermes", invoke: "respond", payload: '{"ok":true}' } });
         const hermesActivation = { triggerId: "hermes", source: "manual" as const, payload: {}, receivedAt: new Date().toISOString() };
